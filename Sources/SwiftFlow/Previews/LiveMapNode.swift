@@ -76,12 +76,12 @@ struct LiveMapNodeDiagnostics: Sendable, Hashable {
 ///   fades.
 /// - The coordinator additionally pushes a one-shot bootstrap snapshot
 ///   after MapKit reports a fully rendered pass, with a delayed fallback
-///   after the first interaction kick so the poster is non-empty before
+///   after the first hover kick so the poster is non-empty before
 ///   the user hovers out for the first time.
 /// - Region persistence is read/write through the user-supplied
 ///   ``LiveMapNodeStateStore`` so pan/zoom survives real teardown.
-/// - Tile pipeline kick: window-attach callback + non-zero bounds polling
-///   so the map renders without requiring the user to interact first.
+/// - Tile pipeline kick: window-attach callback + hover-driven non-zero
+///   bounds polling so the map renders without requiring a drag first.
 struct LiveMapNode<Data>: View where Data: Sendable & Hashable {
 
     private let node: FlowNode<Data>
@@ -163,20 +163,21 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
     /// Snapshot channel injected by ``LiveMapRepresentable`` from
     /// `\.liveNodeSnapshotContext`. The coordinator uses it to push a
     /// bootstrap snapshot after MapKit reports a fully rendered pass, with
-    /// a delayed fallback after the interaction kick so the poster has a
+    /// a delayed fallback after the hover kick so the poster has a
     /// real frame before the user hovers out for the first time.
     var snapshotContext: LiveNodeSnapshotContext?
 
     /// Only flipped to `true` after a real-size `setRegion` has actually
-    /// landed. Flipping it earlier would consume the interaction edge on a
+    /// landed. Flipping it earlier would consume the hover edge on a
     /// still-zero-bounds view and leave MapKit's tile pipeline dormant
-    /// forever — `updateInteractionState` would never see another false→true.
+    /// forever: `updateInteractionState` would never see another false-to-true
+    /// hover transition.
     private var wasInteractive = false
 
     private var interactionKickTask: Task<Void, Never>?
 
     /// One-shot delayed task that pushes the first real snapshot once the
-    /// interaction kick has actually rendered tiles.
+    /// hover kick has actually rendered tiles.
     private var initialCaptureTask: Task<Void, Never>?
     private var hasRequestedInitialCapture = false
     private var allowsRegionPersistence = false
@@ -191,8 +192,8 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
         self.stateStore = stateStore
     }
 
-    func updateInteractionState(_ isInteractive: Bool, mapView: MKMapView) {
-        if !isInteractive {
+    func updateInteractionState(_ isHovered: Bool, mapView: MKMapView) {
+        if !isHovered {
             wasInteractive = false
             interactionKickTask?.cancel()
             interactionKickTask = nil
@@ -208,7 +209,7 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 
     /// Forces the map's tile pipeline to wake. Driven by either the
     /// window-attach callback on `LiveMapNodeMapView` or by
-    /// `updateInteractionState` for representables that race ahead of the
+    /// `updateInteractionState` for hover updates that race ahead of the
     /// window attach. Idempotent via `wasInteractive`.
     func kickIfReady(_ mapView: MKMapView) {
         guard !wasInteractive else { return }
@@ -345,7 +346,7 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 #if os(iOS)
 struct LiveMapRepresentable: UIViewRepresentable {
 
-    @Environment(\.isFlowNodeInteractive) private var isInteractive
+    @Environment(\.isFlowNodeHovered) private var isHovered
     @Environment(\.liveNodeSnapshotContext) private var snapshotContext
 
     let nodeID: String
@@ -392,7 +393,7 @@ struct LiveMapRepresentable: UIViewRepresentable {
         let coordinator = context.coordinator
         coordinator.snapshotContext = snapshotContext
         mapView.layer.cornerRadius = cornerRadius
-        coordinator.updateInteractionState(isInteractive, mapView: mapView)
+        coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
 
     static func dismantleUIView(_ mapView: MKMapView, coordinator: LiveMapNodeCoordinator) {
@@ -418,7 +419,7 @@ struct LiveMapRepresentable: UIViewRepresentable {
 #elseif os(macOS)
 struct LiveMapRepresentable: NSViewRepresentable {
 
-    @Environment(\.isFlowNodeInteractive) private var isInteractive
+    @Environment(\.isFlowNodeHovered) private var isHovered
     @Environment(\.liveNodeSnapshotContext) private var snapshotContext
 
     let nodeID: String
@@ -466,7 +467,7 @@ struct LiveMapRepresentable: NSViewRepresentable {
         let coordinator = context.coordinator
         coordinator.snapshotContext = snapshotContext
         mapView.layer?.cornerRadius = cornerRadius
-        coordinator.updateInteractionState(isInteractive, mapView: mapView)
+        coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
 
     static func dismantleNSView(_ mapView: MKMapView, coordinator: LiveMapNodeCoordinator) {

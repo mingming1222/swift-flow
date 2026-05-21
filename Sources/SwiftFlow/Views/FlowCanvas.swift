@@ -516,7 +516,8 @@ public struct FlowCanvas<
             switch phase {
             case .active(let location):
                 let canvasPoint = store.viewport.screenToCanvas(location)
-                store.setHoveredNode(store.hitTestNode(at: canvasPoint), source: "canvas.hover.active")
+                let nodeID = store.hitTestNode(at: canvasPoint)
+                store.setHoveredNode(nodeID, source: "canvas.hover.active")
             case .ended:
                 store.setHoveredNode(nil, source: "canvas.hover.ended")
             @unknown default:

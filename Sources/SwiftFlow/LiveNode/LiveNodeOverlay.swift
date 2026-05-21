@@ -246,7 +246,11 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
                     setOverlayHover: { nodeID in
                         store.setHoveredNode(nodeID, source: "overlay.hover.active")
                     },
-                    clearOverlayHover: { _ in },
+                    clearOverlayHover: { nodeID in
+                        if store.hoveredNodeID == nodeID {
+                            store.setHoveredNode(nil, source: "overlay.hover.ended")
+                        }
+                    },
                     selectNodeForDirectInteraction: { nodeID, isAdditive in
                         let mode: FlowSelectionMode = isAdditive ? .toggle : .replace
                         store.selectNodeFromPointer(nodeID, mode: mode)
@@ -434,6 +438,16 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
                     width: node.size.width + handleInset * 2,
                     height: node.size.height + handleInset * 2
                 )
+                .contentShape(
+                    LiveNodeOverlayContentShape(
+                        rect: CGRect(
+                            x: handleInset,
+                            y: handleInset,
+                            width: node.size.width,
+                            height: node.size.height
+                        )
+                    )
+                )
                 .scaleEffect(viewport.zoom, anchor: .topLeading)
                 .offset(
                     x: screenOrigin.x - handleInset * viewport.zoom,
@@ -454,6 +468,8 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
                 )
                 .liveNodeOverlayHoverTracking(
                     nodeID: node.id,
+                    viewport: viewport,
+                    nodeFrame: node.frame,
                     setHover: setOverlayHover,
                     clearHover: clearOverlayHover
                 )
@@ -473,14 +489,22 @@ private extension View {
     @ViewBuilder
     func liveNodeOverlayHoverTracking(
         nodeID: String,
+        viewport: Viewport,
+        nodeFrame: CGRect,
         setHover: @escaping (String) -> Void,
         clearHover: @escaping (String) -> Void
     ) -> some View {
         #if os(macOS)
         self.onContinuousHover { phase in
             switch phase {
-            case .active:
-                setHover(nodeID)
+            case .active(let location):
+                let canvasPoint = viewport.screenToCanvas(location)
+                let contains = nodeFrame.contains(canvasPoint)
+                if contains {
+                    setHover(nodeID)
+                } else {
+                    clearHover(nodeID)
+                }
             case .ended:
                 clearHover(nodeID)
             @unknown default:
@@ -490,5 +514,13 @@ private extension View {
         #else
         self
         #endif
+    }
+}
+
+private struct LiveNodeOverlayContentShape: Shape {
+    let rect: CGRect
+
+    func path(in _: CGRect) -> Path {
+        Path(rect)
     }
 }
