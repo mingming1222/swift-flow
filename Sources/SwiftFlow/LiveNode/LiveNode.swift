@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 // MARK: - LiveNode
@@ -18,7 +19,7 @@ import SwiftUI
 /// For native views (`WKWebView`, `MKMapView`, `AVPlayerView`) the developer
 /// owns the underlying instance through `@State` and the wrapping
 /// representable participates in the snapshot pipeline by reading
-/// `\.liveNodeSnapshotContext` from the environment:
+/// `\.liveNodePosterContext` from the environment:
 ///
 /// ```swift
 /// @State private var webView = WKWebView()
@@ -29,10 +30,10 @@ import SwiftUI
 /// ```
 ///
 /// Inside `WebRepresentable.makeUIView` / `makeNSView` the developer reads
-/// `\.liveNodeSnapshotContext` and either registers a capture handler
+/// `\.liveNodePosterContext` and either registers a snapshot provider
 /// (called during interaction end) or pushes a snapshot directly when an
 /// internal event lands (navigation finish, tile render). See
-/// ``LiveNodeSnapshotContext`` for details.
+/// ``LiveNodePosterContext`` for details.
 public struct LiveNode<Content: View, Placeholder: View>: View {
 
     private let explicitNode: LiveNodeDescriptor?
@@ -45,11 +46,15 @@ public struct LiveNode<Content: View, Placeholder: View>: View {
     public init<Data>(
         node: FlowNode<Data>,
         mount: LiveNodeMountPolicy = .onInteraction,
+        poster: LiveNodePosterPolicy = .automatic,
         @ViewBuilder content: @escaping () -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) where Data: Sendable & Hashable {
         self.explicitNode = LiveNodeDescriptor(node: node)
-        self.configuration = LiveNodeConfiguration(mountPolicy: mount)
+        self.configuration = LiveNodeConfiguration(
+            mountPolicy: mount,
+            posterPolicy: poster
+        )
         self.content = { _ in content() }
         self.placeholder = placeholder
     }
@@ -57,11 +62,15 @@ public struct LiveNode<Content: View, Placeholder: View>: View {
     public init<Data>(
         node: FlowNode<Data>,
         mount: LiveNodeMountPolicy = .onInteraction,
+        poster: LiveNodePosterPolicy = .automatic,
         @ViewBuilder content: @escaping (LiveNodeContentContext) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) where Data: Sendable & Hashable {
         self.explicitNode = LiveNodeDescriptor(node: node)
-        self.configuration = LiveNodeConfiguration(mountPolicy: mount)
+        self.configuration = LiveNodeConfiguration(
+            mountPolicy: mount,
+            posterPolicy: poster
+        )
         self.content = content
         self.placeholder = placeholder
     }
@@ -101,11 +110,13 @@ extension LiveNode where Placeholder == FlowDefaultPlaceholder {
     public init<Data>(
         node: FlowNode<Data>,
         mount: LiveNodeMountPolicy = .onInteraction,
+        poster: LiveNodePosterPolicy = .automatic,
         @ViewBuilder content: @escaping () -> Content
     ) where Data: Sendable & Hashable {
         self.init(
             node: node,
             mount: mount,
+            poster: poster,
             content: content,
             placeholder: { FlowDefaultPlaceholder() }
         )
@@ -114,29 +125,71 @@ extension LiveNode where Placeholder == FlowDefaultPlaceholder {
     public init<Data>(
         node: FlowNode<Data>,
         mount: LiveNodeMountPolicy = .onInteraction,
+        poster: LiveNodePosterPolicy = .automatic,
         @ViewBuilder content: @escaping (LiveNodeContentContext) -> Content
     ) where Data: Sendable & Hashable {
         self.init(
             node: node,
             mount: mount,
+            poster: poster,
             content: content,
             placeholder: { FlowDefaultPlaceholder() }
         )
     }
 }
 
-// MARK: - Native Capture Registry
+// MARK: - Snapshot Registry
 
-/// Per-`LiveNode` slot for the native capture handler installed by a
-/// descendant representable through ``LiveNodeSnapshotContext``.
+/// Per-`LiveNode` slots for explicit native and live-view snapshot providers.
 ///
 /// Reference type so registering / clearing the handler from within
 /// `makeUIView` / `dismantleUIView` does not invalidate the surrounding
-/// SwiftUI body — the registry is held by `@State` and only its single
-/// property is mutated.
+/// SwiftUI body.
 @MainActor
-final class LiveNodeNativeCaptureRegistry {
-    var handler: (@MainActor () async -> FlowNodeSnapshot?)?
+final class LiveNodeSnapshotRegistry {
+    private var nativeHandler: (@MainActor () async -> FlowNodeSnapshot?)?
+    private var mountedViewHandler: (@MainActor () async -> FlowNodeSnapshot?)?
+    private var mountedViewHandlerToken: UUID?
+
+    func setNativeSnapshotProvider(_ handler: @escaping @MainActor () async -> FlowNodeSnapshot?) {
+        nativeHandler = handler
+    }
+
+    func clearNativeSnapshotProvider() {
+        nativeHandler = nil
+    }
+
+    func nativeSnapshotProvider() -> (@MainActor () async -> FlowNodeSnapshot?)? {
+        nativeHandler
+    }
+
+    func setMountedViewSnapshotProvider(
+        token: UUID,
+        handler: @escaping @MainActor () async -> FlowNodeSnapshot?
+    ) {
+        mountedViewHandlerToken = token
+        mountedViewHandler = handler
+    }
+
+    func clearMountedViewSnapshotProvider(token: UUID) {
+        guard mountedViewHandlerToken == token else {
+            return
+        }
+        mountedViewHandlerToken = nil
+        mountedViewHandler = nil
+    }
+
+    func mountedViewSnapshotProvider() -> (@MainActor () async -> FlowNodeSnapshot?)? {
+        mountedViewHandler
+    }
+
+    func preferredSnapshotProvider() -> (@MainActor () async -> FlowNodeSnapshot?)? {
+        nativeHandler ?? mountedViewHandler
+    }
+
+    var hasMountedViewSnapshotProvider: Bool {
+        mountedViewHandler != nil
+    }
 }
 
 // MARK: - Core
@@ -156,8 +209,10 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     @Environment(\.liveNodeInteractionCoordinator) private var coordinator
     @Environment(\.defersLiveNodeSnapshotWrites) private var defersSnapshotWrites
 
-    @State private var nativeCapture = LiveNodeNativeCaptureRegistry()
+    @State private var snapshotRegistry = LiveNodeSnapshotRegistry()
     @State private var hasSeededInitialSnapshot: Bool = false
+    @State private var isSeedingInitialSnapshot: Bool = false
+    @State private var snapshotProviderReadinessRevision: Int = 0
     private var contentContext: LiveNodeContentContext {
         LiveNodeContentContext(
             id: environment.id,
@@ -175,7 +230,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 key: LiveNodeMountPolicyKey.self,
                 value: [environment.id: configuration.mountPolicy]
             )
-            .environment(\.liveNodeSnapshotContext, makeSnapshotContext())
+            .environment(\.liveNodePosterContext, makePosterContext())
     }
 
     @ViewBuilder
@@ -191,117 +246,129 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             LiveNodeLiveBody(
                 snapshot: environment.snapshot,
                 mountPolicy: configuration.mountPolicy,
+                size: environment.size,
+                scale: snapshotScale,
+                snapshotRegistry: snapshotRegistry,
+                swiftUIEnvironment: swiftUIEnvironment,
+                snapshotProviderReady: {
+                    snapshotProviderReadinessRevision += 1
+                },
                 content: { content(contentContext) }
             )
             .task(id: environment.id) {
-                registerInteractionEndCapture()
+                registerInteractionEndSnapshotProvider()
+            }
+            .task(id: initialSnapshotSeedTrigger) {
                 await seedInitialSnapshotIfNeeded()
             }
             .onDisappear {
-                unregisterInteractionEndCapture()
+                unregisterInteractionEndSnapshotProvider()
             }
         }
     }
 
+    private var initialSnapshotSeedTrigger: InitialSnapshotSeedTrigger {
+        InitialSnapshotSeedTrigger(
+            nodeID: environment.id,
+            isSnapshotMissing: environment.snapshot == nil,
+            defersSnapshotWrites: defersSnapshotWrites,
+            readinessRevision: snapshotProviderReadinessRevision
+        )
+    }
+
     @MainActor
-    private func registerInteractionEndCapture() {
-        coordinator?.registerCapture(for: environment.id) {
-            await captureNow()
+    private func registerInteractionEndSnapshotProvider() {
+        coordinator?.registerPosterProvider(for: environment.id) {
+            guard configuration.posterPolicy.interactionEndCapture == .automatic else {
+                return
+            }
+            await refreshSnapshot()
         }
     }
 
     @MainActor
-    private func unregisterInteractionEndCapture() {
-        coordinator?.unregisterCapture(for: environment.id)
+    private func unregisterInteractionEndSnapshotProvider() {
+        coordinator?.unregisterPosterProvider(for: environment.id)
     }
 
     @MainActor
     private func seedInitialSnapshotIfNeeded() async {
-        guard configuration.mountPolicy == .onInteraction else { return }
+        guard configuration.posterPolicy.initialCapture == .automatic else { return }
         guard environment.snapshot == nil else { return }
         guard !hasSeededInitialSnapshot else { return }
+        guard !isSeedingInitialSnapshot else { return }
         guard !defersSnapshotWrites else { return }
-        hasSeededInitialSnapshot = true
+        guard snapshotRegistry.hasMountedViewSnapshotProvider else { return }
 
-        do {
-            try await Task.sleep(nanoseconds: 16_000_000)
-        } catch {
-            return
+        isSeedingInitialSnapshot = true
+        defer {
+            isSeedingInitialSnapshot = false
         }
-        guard !Task.isCancelled else { return }
-        guard environment.snapshot == nil else { return }
 
-        await captureNow()
+        let didWriteSnapshot = await refreshSnapshot()
+        if didWriteSnapshot {
+            hasSeededInitialSnapshot = true
+        }
     }
 
     @MainActor
-    private func captureNow() async {
-        guard let snapshotWriter else { return }
+    @discardableResult
+    private func refreshSnapshot() async -> Bool {
+        guard let snapshotWriter else { return false }
         guard !Task.isCancelled else {
-            return
+            return false
+        }
+        guard await Self.waitForStablePosterFrame() else {
+            return false
         }
         guard let snapshot = await produceSnapshot() else {
-            return
+            return false
         }
         guard !Task.isCancelled else {
-            return
+            return false
         }
         snapshotWriter(environment.id, snapshot)
+        return true
     }
 
     @MainActor
     private func produceSnapshot() async -> FlowNodeSnapshot? {
-        if let nativeHandler = nativeCapture.handler {
-            return await nativeHandler()
-        }
-        return captureWithImageRenderer()
-    }
-
-    @MainActor
-    private func captureWithImageRenderer() -> FlowNodeSnapshot? {
-        let scale = captureScale
-
-        let renderer = ImageRenderer(
-            content:
-                content(contentContext)
-                .frame(width: environment.size.width, height: environment.size.height)
-                .environment(\.self, swiftUIEnvironment)
-        )
-        renderer.scale = scale
-
-        guard let cgImage = renderer.cgImage else {
+        guard let handler = snapshotRegistry.preferredSnapshotProvider() else {
             return nil
         }
-        return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
+        return await handler()
     }
 
-    private var captureScale: CGFloat {
+    private var snapshotScale: CGFloat {
         min(max(displayScale * 2, 2), 4)
     }
 
     @MainActor
-    private func makeSnapshotContext() -> LiveNodeSnapshotContext? {
+    private func makePosterContext() -> LiveNodePosterContext? {
         guard let snapshotWriter else { return nil }
         let nodeID = environment.id
-        let registry = nativeCapture
+        let registry = snapshotRegistry
         let allowsImmediateSnapshotWrites = !defersSnapshotWrites
-        return LiveNodeSnapshotContext(
+        return LiveNodePosterContext(
             nodeID: nodeID,
             write: { snapshot in
                 snapshotWriter(nodeID, snapshot)
             },
-            registerCapture: { handler in
-                registry.handler = handler
+            registerPosterProvider: { handler in
+                registry.setNativeSnapshotProvider(handler)
             },
-            unregisterCapture: {
-                registry.handler = nil
+            unregisterPosterProvider: {
+                registry.clearNativeSnapshotProvider()
             },
             allowsImmediateSnapshotWrites: {
                 allowsImmediateSnapshotWrites
             },
-            requestCapture: {
-                guard let handler = registry.handler else { return }
+            requestPosterUpdate: {
+                guard let handler = registry.preferredSnapshotProvider() else { return }
                 guard !Task.isCancelled else {
+                    return
+                }
+                guard await Self.waitForStablePosterFrame() else {
                     return
                 }
                 guard let snapshot = await handler() else {
@@ -314,6 +381,24 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             }
         )
     }
+
+    @MainActor
+    private static func waitForStablePosterFrame() async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        } catch {
+            return false
+        }
+        await Task.yield()
+        return !Task.isCancelled
+    }
+}
+
+private struct InitialSnapshotSeedTrigger: Hashable {
+    let nodeID: String
+    let isSnapshotMissing: Bool
+    let defersSnapshotWrites: Bool
+    let readinessRevision: Int
 }
 
 // MARK: - Rasterized Body
@@ -338,6 +423,11 @@ private struct RasterizedNodeBody<Placeholder: View>: View {
 private struct LiveNodeLiveBody<Content: View>: View {
     let snapshot: FlowNodeSnapshot?
     let mountPolicy: LiveNodeMountPolicy
+    let size: CGSize
+    let scale: CGFloat
+    let snapshotRegistry: LiveNodeSnapshotRegistry
+    let swiftUIEnvironment: EnvironmentValues
+    let snapshotProviderReady: () -> Void
     let content: () -> Content
 
     var body: some View {
@@ -348,6 +438,18 @@ private struct LiveNodeLiveBody<Content: View>: View {
             }
 
             content()
+                .overlay(alignment: .topLeading) {
+                    LiveNodeMountedViewSnapshotHost(
+                        size: size,
+                        scale: scale,
+                        registry: snapshotRegistry,
+                        swiftUIEnvironment: swiftUIEnvironment,
+                        snapshotProviderReady: snapshotProviderReady,
+                        content: content
+                    )
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
         }
     }
 

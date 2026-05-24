@@ -32,9 +32,11 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public private(set) var nodeLookup: [String: FlowNode<Data>] = [:]
     public private(set) var connectionLookup: [String: [FlowEdge]] = [:]
 
-    /// Indices into `nodes` sorted by zIndex descending (front-to-back) for hit testing.
+    /// Indices into `nodes` sorted by zIndex descending (front-to-back).
     /// Stable: among equal zIndex, later array index (added later) appears first.
     private(set) var nodeIndicesFrontToBack: [Int] = []
+    /// Hit-test order derived from front-to-back order, with descendants before ancestors.
+    private var nodeIndicesHitTestOrder: [Int] = []
 
     // MARK: - Internal State
 
@@ -383,10 +385,11 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public func updateNode(_ nodeID: String, _ transform: (inout FlowNode<Data>) -> Void) {
         guard let index = nodes.firstIndex(where: { $0.id == nodeID }) else { return }
         let oldZIndex = nodes[index].zIndex
+        let oldParentID = nodes[index].parentID
         let oldSize = nodes[index].size
         transform(&nodes[index])
         nodeLookup[nodeID] = nodes[index]
-        if nodes[index].zIndex != oldZIndex {
+        if nodes[index].zIndex != oldZIndex || nodes[index].parentID != oldParentID {
             rebuildSortedNodes()
         }
         if nodes[index].size != oldSize {
@@ -1513,7 +1516,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         var bestDistance: CGFloat = threshold
         var bestResult: (nodeID: String, handleID: String)?
 
-        for index in nodeIndicesFrontToBack {
+        for index in nodeIndicesHitTestOrder {
             let node = nodes[index]
             guard node.id != excludingNodeID else { continue }
             for handle in node.handles {
@@ -1538,7 +1541,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         var bestDistance: CGFloat = threshold
         var bestResult: HandleHitResult?
 
-        for index in nodeIndicesFrontToBack {
+        for index in nodeIndicesHitTestOrder {
             let node = nodes[index]
             for handle in node.handles {
                 let area = handle.connectionStartArea ?? .point(radius: threshold)
@@ -1561,7 +1564,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     func hitTestNode(at canvasPoint: CGPoint) -> String? {
-        for index in nodeIndicesFrontToBack {
+        for index in nodeIndicesHitTestOrder {
             if nodes[index].frame.contains(canvasPoint) {
                 return nodes[index].id
             }
@@ -1737,6 +1740,17 @@ public final class FlowStore<Data: Sendable & Hashable> {
         }
     }
 
+    private func isAncestor(_ ancestorID: String, of nodeID: String) -> Bool {
+        var currentParentID = nodeLookup[nodeID]?.parentID
+        while let parentID = currentParentID {
+            if parentID == ancestorID {
+                return true
+            }
+            currentParentID = nodeLookup[parentID]?.parentID
+        }
+        return false
+    }
+
     private func collectDescendantNodeIDs(of nodeID: String, into result: inout Set<String>) {
         for child in nodes where child.parentID == nodeID {
             guard result.insert(child.id).inserted else { continue }
@@ -1769,13 +1783,18 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     private func applyParentIDs(_ parentIDs: [String: String?]) {
+        var didChangeHierarchy = false
         for (nodeID, parentID) in parentIDs {
             guard isValidNodeParent(parentID, for: nodeID) else { continue }
             guard let index = nodes.firstIndex(where: { $0.id == nodeID }) else { continue }
             guard nodes[index].parentID != parentID else { continue }
             nodes[index].parentID = parentID
             nodeLookup[nodeID] = nodes[index]
+            didChangeHierarchy = true
             emitNodeChange(.replace(nodes[index]))
+        }
+        if didChangeHierarchy {
+            rebuildSortedNodes()
         }
     }
 
@@ -1854,6 +1873,20 @@ public final class FlowStore<Data: Sendable & Hashable> {
             }
             return lhs > rhs
         }
+        nodeIndicesHitTestOrder = nodeIndicesFrontToBack.enumerated()
+            .sorted { lhs, rhs in
+                let lhsID = nodes[lhs.element].id
+                let rhsID = nodes[rhs.element].id
+
+                if isAncestor(lhsID, of: rhsID) {
+                    return false
+                }
+                if isAncestor(rhsID, of: lhsID) {
+                    return true
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 
     private func rebuildConnectionLookup() {

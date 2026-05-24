@@ -6,9 +6,14 @@ import SwiftUI
 /// callers do not build it directly.
 public struct LiveNodeConfiguration: Sendable {
     public var mountPolicy: LiveNodeMountPolicy
+    public var posterPolicy: LiveNodePosterPolicy
 
-    public init(mountPolicy: LiveNodeMountPolicy = .onInteraction) {
+    public init(
+        mountPolicy: LiveNodeMountPolicy = .onInteraction,
+        posterPolicy: LiveNodePosterPolicy = .automatic
+    ) {
         self.mountPolicy = mountPolicy
+        self.posterPolicy = posterPolicy
     }
 
     public static let `default` = LiveNodeConfiguration()

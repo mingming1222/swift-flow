@@ -101,6 +101,78 @@ struct FlowStoreHierarchyTests {
         #expect(store.nodeLookup["child"]?.parentID == nil)
     }
 
+    @Test("Hit testing prefers a child over its containing group")
+    func hitTestingPrefersChildOverContainingGroup() {
+        let store = FlowStore<String>()
+        store.addNode(
+            FlowNode(
+                id: "group",
+                position: .zero,
+                size: CGSize(width: 120, height: 120),
+                data: "Group",
+                acceptsChildren: true,
+                zIndex: 10
+            )
+        )
+        store.addNode(
+            FlowNode(
+                id: "child",
+                position: CGPoint(x: 20, y: 20),
+                size: CGSize(width: 40, height: 40),
+                data: "Child",
+                parentID: "group",
+                zIndex: 0
+            )
+        )
+
+        #expect(store.hitTestNode(at: CGPoint(x: 30, y: 30)) == "child")
+    }
+
+    @Test("Handle hit testing prefers a child over its containing group")
+    func handleHitTestingPrefersChildOverContainingGroup() {
+        let store = FlowStore<String>()
+        store.addNode(
+            FlowNode(
+                id: "group",
+                position: .zero,
+                size: CGSize(width: 120, height: 120),
+                data: "Group",
+                acceptsChildren: true,
+                zIndex: 10,
+                handles: [
+                    HandleDeclaration(
+                        id: "group-source",
+                        type: .source,
+                        position: .center,
+                        connectionStartArea: .node
+                    ),
+                ]
+            )
+        )
+        store.addNode(
+            FlowNode(
+                id: "child",
+                position: CGPoint(x: 20, y: 20),
+                size: CGSize(width: 40, height: 40),
+                data: "Child",
+                parentID: "group",
+                zIndex: 0,
+                handles: [
+                    HandleDeclaration(
+                        id: "child-source",
+                        type: .source,
+                        position: .center,
+                        connectionStartArea: .node
+                    ),
+                ]
+            )
+        )
+
+        let hit = store.hitTestHandle(at: CGPoint(x: 30, y: 30), threshold: 10)
+        #expect(hit?.nodeID == "child")
+        #expect(hit?.handleID == "child-source")
+    }
+
     @Test("Dragging an element into a group assigns parent")
     func dragElementIntoGroupAssignsParent() {
         let store = FlowStore<String>()

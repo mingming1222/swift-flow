@@ -22,7 +22,7 @@ import SwiftUI
 ///
 /// The warmup mount is what initially boots native representables —
 /// WKWebView starts loading, MKMapView fetches tiles, AVPlayer prepares
-/// an item — so their `.manual(capture:)` handler has a surface to pull
+/// an item — so their snapshot provider has a surface to pull
 /// a snapshot from. Once `context.snapshot` is non-nil the row unmounts
 /// and the Canvas takes over drawing.
 ///
@@ -55,7 +55,7 @@ import SwiftUI
 /// Interaction "rendered" state is owned by
 /// ``LiveNodeInteractionCoordinator``, not by the raw predicate result.
 /// When the predicate flips `true → false` the coordinator awaits the
-/// `LiveNode`-registered capture handler before lowering `renderedInteractive`
+/// `LiveNode`-registered snapshot provider before lowering `renderedInteractive`
 /// — so the rasterize path has a fresh snapshot the instant the overlay
 /// unmounts. The overlay reads `coordinator.renderedInteractive` to decide
 /// which rows to mount, and feeds each body evaluation back in with
@@ -218,45 +218,40 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
                 // warmup branch (`snapshot == nil` is permanent for
                 // them) and end up double-drawn at opacity 1 alongside
                 // the Canvas.
-                let intent = interaction(node, store)
+                let hasInteractionIntent = interaction(node, store)
                 let renderedInteractive = coordinator.isRenderedInteractive(node.id)
                 let mountPolicy = coordinator.mountPolicy(for: node.id)
-                let displayInteractive = intent || renderedInteractive
+                let isOverlayActive = hasInteractionIntent || renderedInteractive
                 let isLiveNode = coordinator.liveNodeIDs.contains(node.id)
                 let isSelected = store.selectedNodeIDs.contains(node.id)
                 let isHovered = store.hoveredNodeID == node.id
                 let isFocused = store.focusedTarget == .node(node.id)
-                let defersSnapshotWrites = intent || isViewportInteracting
+                let defersSnapshotWrites = hasInteractionIntent || isViewportInteracting
+                let keepsVisibleDuringViewportInteraction = mountPolicy == .persistent
                 LiveNodeOverlayRow(
                     node: node,
                     viewport: viewport,
                     handleInset: handleInset,
                     isLiveNode: isLiveNode,
-                    isRenderedInteractive: displayInteractive,
+                    isOverlayActive: isOverlayActive,
+                    hasInteractionIntent: hasInteractionIntent,
                     isSelected: isSelected,
                     isHovered: isHovered,
                     isFocused: isFocused,
-                    shouldShow: displayInteractive && !isViewportInteracting,
-                    isHittable: displayInteractive && !isViewportInteracting,
+                    shouldShow: isOverlayActive
+                        && (!isViewportInteracting || keepsVisibleDuringViewportInteraction),
+                    isHittable: hasInteractionIntent && !isViewportInteracting,
                     isViewportInteracting: isViewportInteracting,
                     defersSnapshotWrites: defersSnapshotWrites,
                     mountPolicy: mountPolicy,
                     renderContext: renderContext(node),
                     nodeContent: nodeContent,
-                    setOverlayHover: { nodeID in
-                        store.setHoveredNode(nodeID, source: "overlay.hover.active")
-                    },
-                    clearOverlayHover: { nodeID in
-                        if store.hoveredNodeID == nodeID {
-                            store.setHoveredNode(nil, source: "overlay.hover.ended")
-                        }
-                    },
                     selectNodeForDirectInteraction: { nodeID, isAdditive in
                         let mode: FlowSelectionMode = isAdditive ? .toggle : .replace
                         store.selectNodeFromPointer(nodeID, mode: mode)
                     }
                 )
-                .onChange(of: intent, initial: true) { _, newIntent in
+                .onChange(of: hasInteractionIntent, initial: true) { _, newIntent in
                     coordinator.update(nodeID: node.id, intent: newIntent)
                 }
             }
@@ -297,15 +292,15 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
 /// - **Interactive**: the coordinator says this node currently has interaction
 ///   intent, so the live view must replace the Canvas snapshot.
 /// - **Warmup**: the node has no snapshot yet, so the live view must mount
-///   invisibly long enough to produce one — this is the only path that
+///   visibly long enough to produce one — this is the only path that
 ///   boots up native representables (WKWebView load, MKMapView tile
-///   fetch, AVPlayer item setup) whose `.manual(capture:)` handler cannot
+///   fetch, AVPlayer item setup) whose snapshot provider cannot
 ///   synthesize a snapshot without the live view being in the view
 ///   hierarchy. Once `context.snapshot` is populated the row unmounts and
 ///   the Canvas `resolveSymbol` path takes over drawing.
 ///
-/// Rows that are neither interactive nor warming collapse to a zero-size
-/// spacer, so the Canvas rasterize path is the sole drawer for idle
+/// Rows that are neither interactive nor warming are transparent to input
+/// and drawing, so the Canvas rasterize path is the sole drawer for idle
 /// LiveNodes.
 private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>: View {
 
@@ -320,7 +315,8 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
     /// rows) would force opacity 1 and produce a double draw on top of
     /// the Canvas.
     let isLiveNode: Bool
-    let isRenderedInteractive: Bool
+    let isOverlayActive: Bool
+    let hasInteractionIntent: Bool
     let isSelected: Bool
     let isHovered: Bool
     let isFocused: Bool
@@ -336,47 +332,48 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
     let mountPolicy: LiveNodeMountPolicy
     let renderContext: NodeRenderContext
     let nodeContent: (FlowNode<NodeData>, NodeRenderContext) -> Content
-    let setOverlayHover: (String) -> Void
-    let clearOverlayHover: (String) -> Void
     let selectNodeForDirectInteraction: (String, Bool) -> Void
 
-    /// Mount decision depends on the per-node mount policy:
-    ///
-    /// - `.onInteraction` (default): mount while interactive OR while
-    ///   the node still has no snapshot — the latter lets SwiftUI-only
-    ///   live nodes seed the snapshot, after which the row unmounts and
-    ///   the Canvas draws from the snapshot instead. It also unmounts
-    ///   while the user is panning or zooming so the Canvas poster takes
-    ///   over for the duration of the gesture; this avoids per-frame
-    ///   SwiftUI re-layout for the live subtree.
-    /// - `.persistent`: stay mounted regardless of interaction OR
-    ///   viewport interaction. Required for native representables
-    ///   backed by a separate process — their `removeFromSuperview`
-    ///   propagates `viewDidMoveToWindow(nil)` into the remote-layer
-    ///   subtree and stalls the CARemoteLayerClient / CAMetalLayer
-    ///   pipeline; keeping the row mounted avoids that detach entirely.
-    ///   While the user is panning or zooming the row's `shouldShow`
-    ///   and `isHittable` already drop to `false` from the owning
-    ///   overlay, so Canvas takes over drawing/hit-testing without
-    ///   tearing down the underlying native view.
-    private var shouldMount: Bool {
+    private var rowState: LiveNodeOverlayRowState {
         // Plain (non-LiveNode) rows never mount: the Canvas symbol pass
         // already draws them, and the warmup branch below would otherwise
         // force a permanent opacity-1 mount because `snapshot == nil` is
         // load-bearing only for LiveNode-backed rows.
         guard isLiveNode else {
-            return false
+            return .unmounted
         }
 
+        let needsSnapshot = renderContext.snapshot == nil
         switch mountPolicy {
         case .onInteraction:
+            // A node with no poster cannot hand off to Canvas yet. Keep
+            // the live subtree mounted through viewport gestures until the
+            // first snapshot lands. Warmup affects only mount/visibility;
+            // it must not synthesize interactive or hittable state.
+            if needsSnapshot {
+                return LiveNodeOverlayRowState(
+                    isVisible: true,
+                    isInteractive: hasInteractionIntent,
+                    isHittable: isHittable
+                )
+            }
+
             // Unmount during pan/zoom so the live subtree is not subjected
             // to per-frame re-layout — the Canvas poster covers the
             // gesture window.
             if isViewportInteracting {
-                return false
+                return .unmounted
             }
-            return isRenderedInteractive || renderContext.snapshot == nil
+
+            guard isOverlayActive else {
+                return .unmounted
+            }
+
+            return LiveNodeOverlayRowState(
+                isVisible: shouldShow,
+                isInteractive: hasInteractionIntent,
+                isHittable: isHittable
+            )
 
         case .persistent:
             // The whole point of `.persistent` is to never detach. The
@@ -384,22 +381,19 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
             // viewport interaction (via shouldShow / isHittable), so
             // Canvas owns the gesture window without disturbing the
             // underlying CARemoteLayer pipeline.
-            return true
+            return LiveNodeOverlayRowState(
+                isVisible: shouldShow || needsSnapshot,
+                isInteractive: hasInteractionIntent,
+                isHittable: isHittable
+            )
         }
     }
 
     var body: some View {
-        if shouldMount {
+        let state = rowState
+        if state.isMounted {
             let screenOrigin = viewport.canvasToScreen(node.position)
-            // The warmup window is the only time a `.native` LiveNode
-            // gets to seed its first snapshot. Native policies do not
-            // self-seed (`seedOnAppear: false`), and the Canvas poster
-            // takes over once a snapshot exists — so until one lands
-            // we mount the live subtree visibly and treat it as
-            // interactive, which lets `MKMapView` / `WKWebView` kick their
-            // tile / load pipeline.
-            //
-            // The row itself stays hit-test enabled so native
+            // When the row is hittable, native
             // representables (`WKWebView`, `MKMapView`, `AVPlayerView`)
             // keep their own scroll / pan / tap handling. To make the
             // node draggable, the caller wraps the grip region (a
@@ -407,21 +401,10 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
             // that region with `.allowsHitTesting(false)` so the
             // Canvas's `primaryDragGesture` underneath captures the
             // drag — the same code path as a plain `FlowNode` drag.
-            let isWarmingUp = renderContext.snapshot == nil
-            let effectiveInteractive = isRenderedInteractive || isWarmingUp
-            let effectiveVisible = shouldShow || isWarmingUp
-            // Hit testing stays off during warmup so the user can't
-            // interact with a node that isn't user-interactive yet — Canvas
-            // gestures (drag-to-move, marquee select) pass through.
-            // For non-LiveNode rows `snapshot` is always nil → warmup
-            // never ends → row stays hit-test transparent forever, so
-            // the Canvas remains the sole drag target for plain nodes.
-            let effectiveHittable = isHittable && !isWarmingUp
-
             nodeContent(node, renderContext)
                 .environment(\.flowNodeRenderPhase, .live)
                 .environment(\.flowNodeID, node.id)
-                .environment(\.isFlowNodeInteractive, effectiveInteractive)
+                .environment(\.isFlowNodeInteractive, state.isInteractive)
                 .environment(\.isFlowNodeSelected, isSelected)
                 .environment(\.isFlowNodeHovered, isHovered)
                 .environment(\.isFlowNodeFocused, isFocused)
@@ -453,25 +436,18 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
                     x: screenOrigin.x - handleInset * viewport.zoom,
                     y: screenOrigin.y - handleInset * viewport.zoom
                 )
-                .opacity(effectiveVisible ? 1 : 0)
-                .allowsHitTesting(effectiveHittable)
+                .opacity(state.isVisible ? 1 : 0)
+                .allowsHitTesting(state.isHittable)
                 .simultaneousGesture(
                     TapGesture()
                         .onEnded {
-                            guard effectiveHittable else { return }
+                            guard state.isHittable else { return }
                             guard !FlowSelectionModifier.isAdditiveSelectionActive else { return }
                             selectNodeForDirectInteraction(
                                 node.id,
                                 false
                             )
                         }
-                )
-                .liveNodeOverlayHoverTracking(
-                    nodeID: node.id,
-                    viewport: viewport,
-                    nodeFrame: node.frame,
-                    setHover: setOverlayHover,
-                    clearHover: clearOverlayHover
                 )
         } else {
             Color.clear
@@ -484,36 +460,41 @@ private struct LiveNodeOverlayRow<NodeData: Sendable & Hashable, Content: View>:
     }
 }
 
-private extension View {
+private struct LiveNodeOverlayRowState {
 
-    @ViewBuilder
-    func liveNodeOverlayHoverTracking(
-        nodeID: String,
-        viewport: Viewport,
-        nodeFrame: CGRect,
-        setHover: @escaping (String) -> Void,
-        clearHover: @escaping (String) -> Void
-    ) -> some View {
-        #if os(macOS)
-        self.onContinuousHover { phase in
-            switch phase {
-            case .active(let location):
-                let canvasPoint = viewport.screenToCanvas(location)
-                let contains = nodeFrame.contains(canvasPoint)
-                if contains {
-                    setHover(nodeID)
-                } else {
-                    clearHover(nodeID)
-                }
-            case .ended:
-                clearHover(nodeID)
-            @unknown default:
-                break
-            }
-        }
-        #else
-        self
-        #endif
+    let isMounted: Bool
+    let isVisible: Bool
+    let isInteractive: Bool
+    let isHittable: Bool
+
+    static let unmounted = LiveNodeOverlayRowState(
+        isMounted: false,
+        isVisible: false,
+        isInteractive: false,
+        isHittable: false
+    )
+
+    init(
+        isVisible: Bool,
+        isInteractive: Bool,
+        isHittable: Bool
+    ) {
+        self.isMounted = true
+        self.isVisible = isVisible
+        self.isInteractive = isInteractive
+        self.isHittable = isHittable
+    }
+
+    private init(
+        isMounted: Bool,
+        isVisible: Bool,
+        isInteractive: Bool,
+        isHittable: Bool
+    ) {
+        self.isMounted = isMounted
+        self.isVisible = isVisible
+        self.isInteractive = isInteractive
+        self.isHittable = isHittable
     }
 }
 

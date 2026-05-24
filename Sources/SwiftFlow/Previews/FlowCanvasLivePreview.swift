@@ -166,35 +166,11 @@ private struct ResizeHandleOverlay<Data: Sendable & Hashable>: View {
     }
 }
 
-// MARK: - Platform image helpers
-
-#if os(iOS)
-private typealias LivePreviewPlatformImage = UIImage
-#elseif os(macOS)
-private typealias LivePreviewPlatformImage = NSImage
-#endif
-
-private extension LivePreviewPlatformImage {
-    var flowNodeSnapshot: FlowNodeSnapshot? {
-        #if os(iOS)
-        guard let cgImage else { return nil }
-        return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
-        #elseif os(macOS)
-        var rect = CGRect(origin: .zero, size: size)
-        guard let cgImage = cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
-            return nil
-        }
-        let scale = CGFloat(cgImage.width) / max(size.width, 1)
-        return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
-        #endif
-    }
-}
-
 // MARK: - Web support
 
 @MainActor
 private final class WebNodeCoordinator: NSObject, WKNavigationDelegate {
-    var snapshotContext: LiveNodeSnapshotContext?
+    var posterContext: LiveNodePosterContext?
 
     override init() {
         super.init()
@@ -212,9 +188,7 @@ private final class WebNodeCoordinator: NSObject, WKNavigationDelegate {
             } catch {
                 return
             }
-            guard self?.snapshotContext?.allowsImmediateSnapshotWrites == true else { return }
-            guard let snapshot = await webView.makeFlowNodeSnapshot() else { return }
-            self?.snapshotContext?.write(snapshot)
+            await self?.posterContext?.requestPosterUpdate()
         }
     }
 }
@@ -248,27 +222,12 @@ private final class LiveWebView: WKWebView {
     }
 }
 
-private extension WKWebView {
-    @MainActor
-    func makeFlowNodeSnapshot() async -> FlowNodeSnapshot? {
-        let configuration = WKSnapshotConfiguration()
-
-        do {
-            let image = try await takeSnapshot(configuration: configuration)
-            return image.flowNodeSnapshot
-        } catch {
-            return nil
-        }
-    }
-}
-
 #if os(iOS)
 private struct WebNodeRepresentable: UIViewRepresentable {
-    let webView: LiveWebView
     let url: URL
     let cornerRadius: CGFloat
 
-    @Environment(\.liveNodeSnapshotContext) private var snapshotContext
+    @Environment(\.liveNodePosterContext) private var posterContext
 
     func makeCoordinator() -> WebNodeCoordinator {
         WebNodeCoordinator()
@@ -276,48 +235,42 @@ private struct WebNodeRepresentable: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
+        coordinator.posterContext = posterContext
 
+        let webView = LiveWebView()
         webView.navigationDelegate = coordinator
         webView.layer.cornerRadius = cornerRadius
         webView.layer.masksToBounds = true
         webView.scrollView.layer.cornerRadius = cornerRadius
         webView.scrollView.layer.masksToBounds = true
-
-        if webView.url == nil {
-            webView.load(URLRequest(url: url))
-        }
-
-        // Register the interaction-end capture handler with the surrounding
-        // LiveNode. The handler captures `webView` weakly so the
-        // representable does not extend its lifetime past the View's.
-        snapshotContext?.registerCapture { [weak webView] in
-            guard let webView else { return nil }
-            return await webView.makeFlowNodeSnapshot()
-        }
+        loadIfNeeded(webView)
 
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        context.coordinator.snapshotContext = snapshotContext
+        context.coordinator.posterContext = posterContext
         webView.layer.cornerRadius = cornerRadius
         webView.scrollView.layer.cornerRadius = cornerRadius
+        loadIfNeeded(webView)
     }
 
     static func dismantleUIView(_ webView: WKWebView, coordinator: WebNodeCoordinator) {
-        coordinator.snapshotContext?.unregisterCapture()
-        coordinator.snapshotContext = nil
+        coordinator.posterContext = nil
         webView.navigationDelegate = nil
+    }
+
+    private func loadIfNeeded(_ webView: WKWebView) {
+        guard webView.url != url else { return }
+        webView.load(URLRequest(url: url))
     }
 }
 #elseif os(macOS)
 private struct WebNodeRepresentable: NSViewRepresentable {
-    let webView: LiveWebView
     let url: URL
     let cornerRadius: CGFloat
 
-    @Environment(\.liveNodeSnapshotContext) private var snapshotContext
+    @Environment(\.liveNodePosterContext) private var posterContext
 
     func makeCoordinator() -> WebNodeCoordinator {
         WebNodeCoordinator()
@@ -325,48 +278,41 @@ private struct WebNodeRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
+        coordinator.posterContext = posterContext
 
+        let webView = LiveWebView()
+        webView.disableWindowOcclusionDetection()
         webView.navigationDelegate = coordinator
         webView.wantsLayer = true
         webView.layer?.cornerRadius = cornerRadius
         webView.layer?.masksToBounds = true
-
-        if webView.url == nil {
-            webView.load(URLRequest(url: url))
-        }
-
-        // Register the interaction-end capture handler with the surrounding
-        // LiveNode. The handler captures `webView` weakly so the
-        // representable does not extend its lifetime past the View's.
-        snapshotContext?.registerCapture { [weak webView] in
-            guard let webView else { return nil }
-            return await webView.makeFlowNodeSnapshot()
-        }
+        loadIfNeeded(webView)
 
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        context.coordinator.snapshotContext = snapshotContext
+        context.coordinator.posterContext = posterContext
         webView.layer?.cornerRadius = cornerRadius
+        loadIfNeeded(webView)
     }
 
     static func dismantleNSView(_ webView: WKWebView, coordinator: WebNodeCoordinator) {
-        coordinator.snapshotContext?.unregisterCapture()
-        coordinator.snapshotContext = nil
+        coordinator.posterContext = nil
         webView.navigationDelegate = nil
+    }
+
+    private func loadIfNeeded(_ webView: WKWebView) {
+        guard webView.url != url else { return }
+        webView.load(URLRequest(url: url))
     }
 }
 #endif
 
 // MARK: - Web node wrapper
 
-/// View that owns a stable `WKWebView` instance via `@State`. The
-/// representable reads `\.liveNodeSnapshotContext` from the surrounding
-/// `LiveNode` and uses it for both interaction-end capture registration and
-/// post-navigation snapshot pushes — the developer never has to wire a
-/// closure through `LiveNode`'s initializer.
+/// View that lets each mounted representable own its `WKWebView`. The live
+/// host and the isolated poster host must never share one native view instance.
 private struct WebNodeView: View {
 
     let node: FlowNode<LivePreviewData>
@@ -374,18 +320,9 @@ private struct WebNodeView: View {
     let title: String
     let cornerRadius: CGFloat
 
-    @State private var webView: LiveWebView = {
-        let v = LiveWebView()
-        #if os(macOS)
-        v.disableWindowOcclusionDetection()
-        #endif
-        return v
-    }()
-
     var body: some View {
         LiveNode(node: node, mount: .persistent) {
             WebNodeRepresentable(
-                webView: webView,
                 url: url,
                 cornerRadius: cornerRadius
             )
@@ -842,30 +779,7 @@ private struct LivePreviewNodeBody: View {
         let liveNode = contentNode(size: contentSize)
 
         return LiveNode(node: liveNode) {
-            TimelineView(.animation) { timeline in
-                let time = timeline.date.timeIntervalSinceReferenceDate
-
-                ZStack {
-                    color.opacity(0.12 + 0.08 * (0.5 + 0.5 * sin(time * 2)))
-
-                    VStack(spacing: 4) {
-                        Text("\(Int(contentSize.width)) × \(Int(contentSize.height))")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                        Text("Select & drag a corner")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Circle()
-                        .trim(from: 0, to: 0.25)
-                        .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                        .rotationEffect(.degrees(time * 180))
-                        .frame(width: 22, height: 22)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .padding(8)
-                }
-            }
+            ResizableLiveContent(color: color, contentSize: contentSize)
         }
         .allowsHitTesting(false)
     }
@@ -959,6 +873,47 @@ private struct LivePreviewNodeBody: View {
             }
         }
         .allowsHitTesting(false)
+    }
+}
+
+private struct ResizableLiveContent: View {
+
+    let color: Color
+    let contentSize: CGSize
+
+    @Environment(\.isFlowNodeInteractive) private var isInteractive
+
+    var body: some View {
+        if isInteractive {
+            TimelineView(.animation) { timeline in
+                content(time: timeline.date.timeIntervalSinceReferenceDate)
+            }
+        } else {
+            content(time: 0)
+        }
+    }
+
+    private func content(time: TimeInterval) -> some View {
+        ZStack {
+            color.opacity(0.12 + 0.08 * (0.5 + 0.5 * sin(time * 2)))
+
+            VStack(spacing: 4) {
+                Text("\(Int(contentSize.width)) × \(Int(contentSize.height))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Text("Select & drag a corner")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Circle()
+                .trim(from: 0, to: 0.25)
+                .stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .rotationEffect(.degrees(time * 180))
+                .frame(width: 22, height: 22)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(8)
+        }
     }
 }
 

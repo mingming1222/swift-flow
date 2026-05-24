@@ -20,7 +20,7 @@ public struct FlowNodeSnapshot: @unchecked Sendable, Hashable {
     /// node's `size` across display scales.
     public let scale: CGFloat
 
-    /// Capture timestamp. Used by throttled capture cadences (e.g.
+    /// Capture timestamp. Used by throttled snapshot cadences (e.g.
     /// `.periodic`) to decide whether a refresh is due.
     public let capturedAt: Date
 

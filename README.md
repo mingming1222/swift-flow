@@ -248,22 +248,24 @@ FlowCanvas(store: store) { node, ctx in
 }
 ```
 
-For SwiftUI-only content the library re-captures on interaction end using `ImageRenderer` with the full `EnvironmentValues` inherited, so the rasterize path stays consistent with the live phase across interaction transitions. `LiveNode` sizes itself to `node.size`, so the caller does **not** need to apply a `.frame(...)` matching the node — just compose any handle padding, clipping, shadows, or overlays around it.
+`LiveNode` captures posters from the mounted node subtree. It does not rebuild the content through `ImageRenderer`, and it does not capture the containing window. `LiveNode` sizes itself to `node.size`, so the caller does **not** need to apply a `.frame(...)` matching the node — just compose any handle padding, clipping, shadows, or overlays around it.
 
 `LiveNode` is a phase dispatcher — its only sizing decision is matching `node.size`. Visual treatment (corner radius, the handle-inset padding that keeps handles on the border from being clipped, background, overlays, etc.) is composed with ordinary SwiftUI modifiers around `LiveNode`. Handle drawing is likewise the caller's responsibility: use `FlowNodeHandles(node:context:)` for the library default look, or compose `FlowHandle` views directly for fully custom handles.
 
 ### Native Views (WKWebView / MKMapView / AVPlayerView)
 
-`ImageRenderer` cannot rasterize `UIViewRepresentable` / `NSViewRepresentable` content — `WKWebView`, `MKMapView`, `AVPlayerView`, and similar views render as opaque background. SwiftFlow does not bundle wrappers for individual native frameworks; instead, the wrapping representable participates in the snapshot pipeline by reading `\.liveNodeSnapshotContext` from the environment that `LiveNode` publishes for its descendants:
+The standard poster path captures the mounted node bitmap and is independent of the view type. `WKWebView`, `MKMapView`, `AVPlayerView`, pure SwiftUI content, and mixed content all use the same default poster pipeline.
 
-| Method on ``LiveNodeSnapshotContext`` | Purpose |
+`LiveNodePosterContext` exists for views that intentionally choose custom poster timing or a custom poster source. Use it when the default hover-end capture is not the desired semantic moment, such as a video poster that should update only after playback reaches a chosen frame. Do not use it to recreate the node in a separate render tree.
+
+| Method on ``LiveNodePosterContext`` | Purpose |
 |---|---|
-| `write(_:)` | Push a snapshot directly — call after a navigation completes (`WKWebView`), a tile pass lands (`MKMapView`), or any other moment the app already has a fresh frame in hand |
-| `registerCapture(_:)` | Install an async capture handler that `LiveNode` invokes during the interaction-end pipeline — the handler typically reads from the live native view weakly and produces a `FlowNodeSnapshot` |
-| `unregisterCapture()` | Clear the handler — call from `dismantleUIView` / `dismantleNSView` so teardown does not leave a stale handler bound to a dead view |
-| `requestCapture()` | Drive a capture pass on demand, e.g. to seed the poster shortly after the view first attaches |
+| `write(_:)` | Push an explicitly chosen poster when immediate writes are allowed |
+| `registerPosterProvider(_:)` | Install an async provider that `LiveNode` can invoke during poster updates |
+| `unregisterPosterProvider()` | Clear the provider from teardown paths |
+| `requestPosterUpdate()` | Ask `LiveNode` to run the currently preferred provider |
 
-The recommended pattern is to own the native view in `@State` and let the representable wire the snapshot context in `makeUIView` / `makeNSView`:
+The default pattern is to own the native view normally and let `LiveNode` capture the mounted bitmap:
 
 ```swift
 private struct WebNode: View {
@@ -285,48 +287,35 @@ private struct WebRepresentable: UIViewRepresentable {
     let webView: WKWebView
     let url: URL
 
-    @Environment(\.liveNodeSnapshotContext) private var snapshot
-
     func makeUIView(context: Context) -> WKWebView {
         if webView.url == nil { webView.load(URLRequest(url: url)) }
-        snapshot?.registerCapture { [weak webView] in
-            await webView?.makeFlowNodeSnapshot()
-        }
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
-
-    static func dismantleUIView(_ webView: WKWebView, coordinator: ()) {
-        // The View itself can't reach `snapshot` from here; clearing the
-        // handler from inside the navigation delegate (which holds the
-        // context) is the typical pattern.
-    }
 }
 ```
 
-For events that produce a fresh frame outside the interaction-end pipeline — `WKNavigationDelegate.didFinish`, `MKMapViewDelegate.mapViewDidFinishRenderingMap`, `AVPlayerItem.didPlayToEndTimeNotification` — call `snapshot.write(_:)` from the delegate. That path is independent of the interaction-end-triggered capture handler and lets the poster reflect the latest content immediately.
-
-Snapshot helpers are framework-specific. For `WKWebView`:
+When a custom poster source is intentional, register a provider explicitly:
 
 ```swift
-extension WKWebView {
-    @MainActor
-    func makeFlowNodeSnapshot() async -> FlowNodeSnapshot? {
-        do {
-            let image = try await takeSnapshot(configuration: WKSnapshotConfiguration())
-            guard let cgImage = image.cgImage else { return nil }
-            return FlowNodeSnapshot(cgImage: cgImage, scale: image.scale)
-        } catch {
-            return nil
+private struct VideoRepresentable: UIViewRepresentable {
+    let playerView: AVPlayerView
+
+    @Environment(\.liveNodePosterContext) private var posterContext
+
+    func makeUIView(context: Context) -> AVPlayerView {
+        posterContext?.registerPosterProvider { @MainActor in
+            await playerView.currentPosterSnapshot()
         }
+        return playerView
+    }
+
+    static func dismantleUIView(_ view: AVPlayerView, coordinator: ()) {
+        // Clear from the coordinator or owner that stores the context.
     }
 }
 ```
-
-`MKMapView` does not have a one-call snapshot method; use `bitmapImageRepForCachingDisplay(in:)` (macOS) or `UIGraphicsImageRenderer.image { drawHierarchy(in:afterScreenUpdates:) }` (iOS). Use `mount: .persistent` for MapKit so the same `MKMapView` instance stays attached across hover / selection transitions, and write a snapshot after `mapViewDidFinishRenderingMap(_:fullyRendered:)` when MapKit has produced a fresh frame.
-
-When the live content is pure SwiftUI, the representable simply does not register a capture handler. `LiveNode` falls back to `ImageRenderer` to produce the interaction end snapshot.
 
 ### Mount Policy
 
@@ -857,6 +846,54 @@ The library flips placement automatically when the accessory would be clipped by
 | Hover | Mouse over node | Pointer hover |
 | Cursor feedback | Contextual (hand/crosshair/arrow) | N/A |
 | Drop onto canvas | Drag external item onto canvas | Drag external item onto canvas |
+
+## Layout Algorithms
+
+SwiftFlow exposes layout as a protocol, not a fixed policy. Apps can keep
+layout conservative for a canvas tool, or plug in stronger algorithms for
+workflow graphs, compound groups, or graph exploration.
+
+```text
+FlowStore snapshot
+      ↓
+FlowLayoutContext<Data>
+      ↓
+FlowLayoutAlgorithm
+      ↓
+FlowLayoutResult.positions
+      ↓
+FlowStore.applyLayout(...)
+```
+
+| Type | Role |
+|---|---|
+| `FlowLayoutAlgorithm` | Strategy protocol implemented by overlap-removal, layered, force-directed, or app-specific algorithms |
+| `FlowLayoutContext` | Immutable graph snapshot with nodes, edges, selection, scope, and options |
+| `FlowLayoutScope` | Limits layout to all nodes, selected nodes, explicit IDs, descendants, or children of a group |
+| `FlowLayoutOptions` | Shared knobs such as spacing, padding, locked nodes, and whether to preserve relative positions |
+| `FlowLayoutResult` | Position updates returned by the algorithm |
+
+Example:
+
+```swift
+struct TidyLayout<Data: Sendable & Hashable>: FlowLayoutAlgorithm {
+    func layout(context: FlowLayoutContext<Data>) throws -> FlowLayoutResult {
+        var positions: [String: CGPoint] = [:]
+        for node in context.scopedNodes {
+            positions[node.id] = node.position
+            // Apply app-specific overlap removal / alignment here.
+        }
+        return FlowLayoutResult(positions: positions)
+    }
+}
+
+try store.layout(
+    using: TidyLayout<String>(),
+    scope: .selected,
+    options: FlowLayoutOptions(lockedNodeIDs: ["anchor"]),
+    animation: .smooth
+)
+```
 
 ## Architecture
 

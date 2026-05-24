@@ -290,7 +290,7 @@ public struct FlowCanvas<
     // MARK: - Live Node Interaction Coordinator
 
     /// Owns the two-phase deinteraction state shared by `LiveNode`
-    /// (registers capture handlers), `LiveNodeOverlay` (reads
+    /// (registers snapshot providers), `LiveNodeOverlay` (reads
     /// `renderedInteractive` for opacity/hit testing), and `drawNodes` (skips
     /// drawing nodes whose live overlay is covering them).
     @State private var liveNodeInteractionCoordinator = LiveNodeInteractionCoordinator()
@@ -419,37 +419,7 @@ public struct FlowCanvas<
                 scheduleEndViewportInteraction()
             },
             cursorAt: { location in
-                switch dragMode {
-                case .nodeMove:
-                    return .closedHand
-                case .connection:
-                    return .crosshair
-                case .selection, .none:
-                    break
-                }
-
-                let canvasPoint = store.viewport.screenToCanvas(location)
-                let nodeID = store.hitTestNode(at: canvasPoint)
-                let previousNodeID = store.hoveredNodeID
-                let previousFrame = previousNodeID.flatMap { store.nodeLookup[$0]?.frame }
-                let previousContainsPoint = previousFrame?.contains(canvasPoint) ?? false
-                if let previousNodeID,
-                   liveNodeInteractionCoordinator.isRenderedInteractive(previousNodeID),
-                   previousContainsPoint,
-                   nodeID != previousNodeID {
-                    return .arrow
-                }
-                store.setHoveredNode(nodeID, source: "canvas.cursorAt")
-
-                if store.hitTestHandle(at: canvasPoint) != nil {
-                    return .crosshair
-                }
-                if let nodeID,
-                   let node = store.nodeLookup[nodeID],
-                   node.isDraggable {
-                    return .openHand
-                }
-                return .arrow
+                cursor(at: location)
             },
             onMouseExited: {
                 store.setHoveredNode(nil, source: "canvas.mouseExited")
@@ -497,6 +467,18 @@ public struct FlowCanvas<
                 layer: .overlay,
                 builders: selectionAccessoryBuilders
             )
+            CanvasHoverTrackingView(
+                onHover: { location in
+                    updateHover(at: location, source: "canvas.hoverTracking")
+                },
+                onExit: {
+                    store.setHoveredNode(nil, source: "canvas.hoverTracking.ended")
+                },
+                cursorAt: { location in
+                    cursor(at: location)
+                }
+            )
+            .frame(width: size.width, height: size.height)
         }
         .environment(\.flowLiveNodeSnapshotWriter, snapshotWriter)
         #else
@@ -1094,6 +1076,36 @@ public struct FlowCanvas<
         viewportInteractionResetTask = nil
         isViewportInteracting = false
     }
+
+    #if os(macOS)
+    private func updateHover(at location: CGPoint, source: String) {
+        let canvasPoint = store.viewport.screenToCanvas(location)
+        let nodeID = store.hitTestNode(at: canvasPoint)
+        store.setHoveredNode(nodeID, source: source)
+    }
+
+    private func cursor(at location: CGPoint) -> NSCursor {
+        switch dragMode {
+        case .nodeMove:
+            return .closedHand
+        case .connection:
+            return .crosshair
+        case .selection, .none:
+            break
+        }
+
+        let canvasPoint = store.viewport.screenToCanvas(location)
+        if store.hitTestHandle(at: canvasPoint) != nil {
+            return .crosshair
+        }
+        if let nodeID = store.hitTestNode(at: canvasPoint),
+           let node = store.nodeLookup[nodeID],
+           node.isDraggable {
+            return .openHand
+        }
+        return .arrow
+    }
+    #endif
 
     // MARK: - Drawing: Edges (symbol-based)
 

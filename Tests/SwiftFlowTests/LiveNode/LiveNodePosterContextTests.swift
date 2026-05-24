@@ -2,30 +2,30 @@ import CoreGraphics
 import Testing
 @testable import SwiftFlow
 
-@Suite("LiveNodeSnapshotContext Tests")
+@Suite("LiveNodePosterContext Tests")
 @MainActor
-struct LiveNodeSnapshotContextTests {
+struct LiveNodePosterContextTests {
 
     @Test("Immediate writes and requests are skipped while deferred")
     func immediateWritesAndRequestsAreSkippedWhileDeferred() async throws {
         let counter = SnapshotWriteCounter()
-        let context = LiveNodeSnapshotContext(
+        let context = LiveNodePosterContext(
             nodeID: "node",
             write: { _ in
                 counter.increment()
             },
-            registerCapture: { _ in },
-            unregisterCapture: {},
+            registerPosterProvider: { _ in },
+            unregisterPosterProvider: {},
             allowsImmediateSnapshotWrites: {
                 false
             },
-            requestCapture: {
+            requestPosterUpdate: {
                 counter.increment()
             }
         )
 
         context.write(try makeSnapshot())
-        await context.requestCapture()
+        await context.requestPosterUpdate()
 
         #expect(counter.count == 0)
     }
@@ -33,23 +33,23 @@ struct LiveNodeSnapshotContextTests {
     @Test("Immediate writes and requests run when allowed")
     func immediateWritesAndRequestsRunWhenAllowed() async throws {
         let counter = SnapshotWriteCounter()
-        let context = LiveNodeSnapshotContext(
+        let context = LiveNodePosterContext(
             nodeID: "node",
             write: { _ in
                 counter.increment()
             },
-            registerCapture: { _ in },
-            unregisterCapture: {},
+            registerPosterProvider: { _ in },
+            unregisterPosterProvider: {},
             allowsImmediateSnapshotWrites: {
                 true
             },
-            requestCapture: {
+            requestPosterUpdate: {
                 counter.increment()
             }
         )
 
         context.write(try makeSnapshot())
-        await context.requestCapture()
+        await context.requestPosterUpdate()
 
         #expect(counter.count == 2)
     }
@@ -65,10 +65,10 @@ struct LiveNodeSnapshotContextTests {
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            throw SnapshotContextTestError.contextCreationFailed
+            throw PosterContextTestError.contextCreationFailed
         }
         guard let image = context.makeImage() else {
-            throw SnapshotContextTestError.imageCreationFailed
+            throw PosterContextTestError.imageCreationFailed
         }
         return FlowNodeSnapshot(cgImage: image, scale: 1)
     }
@@ -83,7 +83,7 @@ private final class SnapshotWriteCounter {
     }
 }
 
-private enum SnapshotContextTestError: Error {
+private enum PosterContextTestError: Error {
     case contextCreationFailed
     case imageCreationFailed
 }

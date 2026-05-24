@@ -68,16 +68,8 @@ struct LiveMapNodeDiagnostics: Sendable, Hashable {
 /// - Mount policy is ``LiveNodeMountPolicy/persistent``: MapKit's native
 ///   renderer stays mounted across interaction changes, while the Canvas
 ///   still draws the poster when the node is idle.
-/// - ``LiveMapRepresentable`` reads `\.liveNodeSnapshotContext` and uses
-///   it to register an interaction-end capture handler from `makeUIView` /
-///   `makeNSView`. The handler captures the live `MKMapView` weakly and
-///   runs while the row is still mounted, so the coordinator's
-///   interaction-end pipeline writes a fresh snapshot before the overlay
-///   fades.
-/// - The coordinator additionally pushes a one-shot bootstrap snapshot
-///   after MapKit reports a fully rendered pass, with a delayed fallback
-///   after the first hover kick so the poster is non-empty before
-///   the user hovers out for the first time.
+/// - SwiftFlow's standard mounted bitmap capture owns poster generation.
+///   The map wrapper does not register a MapKit-specific poster provider.
 /// - Region persistence is read/write through the user-supplied
 ///   ``LiveMapNodeStateStore`` so pan/zoom survives real teardown.
 /// - Tile pipeline kick: window-attach callback + hover-driven non-zero
@@ -160,13 +152,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
     let stateStore: LiveMapNodeStateStore
     private let initialRegion: MKCoordinateRegion
 
-    /// Snapshot channel injected by ``LiveMapRepresentable`` from
-    /// `\.liveNodeSnapshotContext`. The coordinator uses it to push a
-    /// bootstrap snapshot after MapKit reports a fully rendered pass, with
-    /// a delayed fallback after the hover kick so the poster has a
-    /// real frame before the user hovers out for the first time.
-    var snapshotContext: LiveNodeSnapshotContext?
-
     /// Only flipped to `true` after a real-size `setRegion` has actually
     /// landed. Flipping it earlier would consume the hover edge on a
     /// still-zero-bounds view and leave MapKit's tile pipeline dormant
@@ -176,10 +161,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 
     private var interactionKickTask: Task<Void, Never>?
 
-    /// One-shot delayed task that pushes the first real snapshot once the
-    /// hover kick has actually rendered tiles.
-    private var initialCaptureTask: Task<Void, Never>?
-    private var hasRequestedInitialCapture = false
     private var allowsRegionPersistence = false
 
     init(
@@ -197,8 +178,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
             wasInteractive = false
             interactionKickTask?.cancel()
             interactionKickTask = nil
-            initialCaptureTask?.cancel()
-            initialCaptureTask = nil
             return
         }
 
@@ -222,11 +201,7 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
     func tearDown() {
         interactionKickTask?.cancel()
         interactionKickTask = nil
-        initialCaptureTask?.cancel()
-        initialCaptureTask = nil
-        hasRequestedInitialCapture = false
         wasInteractive = false
-        snapshotContext?.unregisterCapture()
     }
 
     private func scheduleInteractionKick(for mapView: MKMapView) {
@@ -254,7 +229,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 
                     self?.wasInteractive = true
                     self?.interactionKickTask = nil
-                    self?.scheduleInitialCaptureFallback(for: view)
                     return
                 }
 
@@ -280,47 +254,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
         stateStore.regions[nodeID] = region
     }
 
-    private func requestInitialCaptureAfterRender(for mapView: MKMapView) {
-        guard !hasRequestedInitialCapture else { return }
-        guard snapshotContext != nil else { return }
-
-        hasRequestedInitialCapture = true
-        initialCaptureTask?.cancel()
-
-        initialCaptureTask = Task { @MainActor [weak self, weak mapView] in
-            do {
-                try await Task.sleep(nanoseconds: 100_000_000)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            guard let self, let mapView else { return }
-            guard let snapshot = await mapView.makeLiveMapNodeSnapshot() else {
-                return
-            }
-            self.snapshotContext?.write(snapshot)
-            self.initialCaptureTask = nil
-        }
-    }
-
-    private func scheduleInitialCaptureFallback(for mapView: MKMapView) {
-        guard !hasRequestedInitialCapture else { return }
-        guard snapshotContext != nil else { return }
-        guard initialCaptureTask == nil else { return }
-
-
-        initialCaptureTask = Task { @MainActor [weak self, weak mapView] in
-            do {
-                try await Task.sleep(nanoseconds: 1_500_000_000)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            guard let self, let mapView else { return }
-            self.requestInitialCaptureAfterRender(for: mapView)
-        }
-    }
-
     private static func applyRegion(_ region: MKCoordinateRegion, on mapView: MKMapView) {
         mapView.setRegion(region, animated: false)
     }
@@ -332,13 +265,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
         }
     }
 
-    nonisolated func mapViewDidFinishRenderingMap(_ mapView: MKMapView, fullyRendered: Bool) {
-        Task { @MainActor [weak self, weak mapView] in
-            guard let self, let mapView else { return }
-            guard fullyRendered else { return }
-            self.requestInitialCaptureAfterRender(for: mapView)
-        }
-    }
 }
 
 // MARK: - Representable
@@ -347,7 +273,6 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 struct LiveMapRepresentable: UIViewRepresentable {
 
     @Environment(\.isFlowNodeHovered) private var isHovered
-    @Environment(\.liveNodeSnapshotContext) private var snapshotContext
 
     let nodeID: String
     let initialCoordinate: CLLocationCoordinate2D
@@ -364,7 +289,6 @@ struct LiveMapRepresentable: UIViewRepresentable {
 
     func makeUIView(context: Context) -> MKMapView {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
 
         let mapView = LiveMapNodeMapView()
         stateStore.recordMake(nodeID: nodeID, mapView: mapView)
@@ -377,21 +301,11 @@ struct LiveMapRepresentable: UIViewRepresentable {
             coordinator?.kickIfReady(view)
         }
 
-        // Register the interaction-end capture handler with the surrounding
-        // LiveNode. The handler captures `mapView` weakly, so it always
-        // reads from the current native view if SwiftUI recreates the
-        // representable for unrelated tree changes.
-        snapshotContext?.registerCapture { [weak mapView] in
-            guard let mapView else { return nil }
-            return await mapView.makeLiveMapNodeSnapshot()
-        }
-
         return mapView
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
         mapView.layer.cornerRadius = cornerRadius
         coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
@@ -420,7 +334,6 @@ struct LiveMapRepresentable: UIViewRepresentable {
 struct LiveMapRepresentable: NSViewRepresentable {
 
     @Environment(\.isFlowNodeHovered) private var isHovered
-    @Environment(\.liveNodeSnapshotContext) private var snapshotContext
 
     let nodeID: String
     let initialCoordinate: CLLocationCoordinate2D
@@ -437,7 +350,6 @@ struct LiveMapRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MKMapView {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
 
         let mapView = LiveMapNodeMapView()
         stateStore.recordMake(nodeID: nodeID, mapView: mapView)
@@ -451,21 +363,11 @@ struct LiveMapRepresentable: NSViewRepresentable {
             coordinator?.kickIfReady(view)
         }
 
-        // Register the interaction-end capture handler with the surrounding
-        // LiveNode. The handler captures `mapView` weakly, so it always
-        // reads from the current native view if SwiftUI recreates the
-        // representable for unrelated tree changes.
-        snapshotContext?.registerCapture { [weak mapView] in
-            guard let mapView else { return nil }
-            return await mapView.makeLiveMapNodeSnapshot()
-        }
-
         return mapView
     }
 
     func updateNSView(_ mapView: MKMapView, context: Context) {
         let coordinator = context.coordinator
-        coordinator.snapshotContext = snapshotContext
         mapView.layer?.cornerRadius = cornerRadius
         coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
@@ -488,46 +390,6 @@ struct LiveMapRepresentable: NSViewRepresentable {
             latitudinalMeters: 3000,
             longitudinalMeters: 3000
         )
-    }
-}
-#endif
-
-// MARK: - Snapshot helper
-
-#if os(macOS)
-private extension MKMapView {
-    @MainActor
-    func makeLiveMapNodeSnapshot() async -> FlowNodeSnapshot? {
-        guard bounds.width > 1, bounds.height > 1 else { return nil }
-        guard let bitmap = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
-        cacheDisplay(in: bounds, to: bitmap)
-        guard let cgImage = bitmap.cgImage else { return nil }
-
-        let scale = window?.backingScaleFactor
-            ?? NSScreen.main?.backingScaleFactor
-            ?? 2
-
-        return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
-    }
-}
-#elseif os(iOS)
-private extension MKMapView {
-    @MainActor
-    func makeLiveMapNodeSnapshot() async -> FlowNodeSnapshot? {
-        guard bounds.width > 1, bounds.height > 1 else { return nil }
-
-        let scale = window?.screen.scale ?? traitCollection.displayScale
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = scale
-        format.opaque = isOpaque
-
-        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
-        let image = renderer.image { _ in
-            drawHierarchy(in: bounds, afterScreenUpdates: true)
-        }
-
-        guard let cgImage = image.cgImage else { return nil }
-        return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
     }
 }
 #endif

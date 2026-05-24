@@ -68,9 +68,11 @@ extension EnvironmentValues {
         set { self[FlowNodeIDKey.self] = newValue }
     }
 
-    /// `true` while the SwiftFlow live overlay considers the enclosing
-    /// node interactive — i.e. the interaction predicate returns `true`
-    /// for it, or the node is warming up its first snapshot.
+    /// `true` while the interaction predicate returns `true` for the
+    /// enclosing node. The overlay may keep drawing the live view after
+    /// interaction ends to capture a final poster, but this value is
+    /// already `false` during that handoff. Snapshot warmup alone also
+    /// does not make this value `true`.
     ///
     /// This is intentionally distinct from selection. The default
     /// interaction predicate treats a hovered node as interactive so native

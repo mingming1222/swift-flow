@@ -26,6 +26,7 @@ Sources/SwiftFlow/
 ├── Document/      # Persisted graph data: FlowDocument, FlowNode, FlowEdge, Viewport, Handle*, EdgePathType
 ├── EdgePaths/     # BezierEdgePath, StraightEdgePath, SmoothStepEdgePath, SimpleBezierEdgePath
 ├── Interaction/   # API-boundary input/output: DropPhase, ConnectionProposal, EdgeGeometry
+├── Layout/        # FlowLayoutAlgorithm, context/scope/options/result, FlowStore layout integration
 ├── LiveNode/      # LiveNode subsystem: phase dispatcher, overlay, activation coordinator, mount/snapshot APIs, FlowNodeSnapshot
 ├── Protocols/     # EdgePathCalculating, ConnectionValidating
 ├── Store/         # FlowStore, FlowConfiguration

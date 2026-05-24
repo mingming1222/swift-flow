@@ -11,7 +11,7 @@ import SwiftUI
 /// 1. User moves cursor off → intent flips to `false`
 /// 2. Overlay opacity 1 → 0 **instantly**
 /// 3. Canvas rasterize path draws the stale cached snapshot
-/// 4. Async capture completes, writes fresh snapshot
+/// 4. Async snapshot provider completes, writes fresh snapshot
 /// 5. Canvas redraws with the new snapshot
 ///
 /// The window between steps 2 and 5 is where the user sees the old
@@ -23,8 +23,8 @@ import SwiftUI
 /// 1. User moves cursor off → intent flips to `false`
 /// 2. Coordinator enters **ending interaction**: `renderedInteractive` stays `true`,
 ///    overlay opacity remains 1, Canvas skip remains in effect
-/// 3. Coordinator awaits the registered capture handler
-/// 4. Capture writes fresh snapshot to the store
+/// 3. Coordinator awaits the registered snapshot provider
+/// 4. Snapshot writes fresh snapshot to the store
 /// 5. `renderedInteractive` flips to `false`, overlay fades, Canvas now draws
 ///    the fresh snapshot as the first visible frame
 ///
@@ -32,8 +32,8 @@ import SwiftUI
 /// cancelled and `renderedInteractive` stays `true` throughout — no flicker.
 ///
 /// The coordinator is injected by `FlowCanvas` via
-/// `\.liveNodeInteractionCoordinator`; `LiveNode` registers its capture
-/// handler on appear and unregisters on disappear.
+/// `\.liveNodeInteractionCoordinator`; `LiveNode` registers its snapshot
+/// provider on appear and unregisters on disappear.
 @MainActor
 @Observable
 final class LiveNodeInteractionCoordinator {
@@ -84,8 +84,8 @@ final class LiveNodeInteractionCoordinator {
     /// Last observed intent per node (used only for edge detection).
     private var intent: [String: Bool] = [:]
 
-    /// Capture handlers registered by `LiveNode` per capture mode.
-    private var captureHandlers: [String: @MainActor () async -> Void] = [:]
+    /// Snapshot providers registered by `LiveNode` per snapshot mode.
+    private var posterProviders: [String: @MainActor () async -> Void] = [:]
 
     /// In-flight interaction-end tasks keyed by node ID.
     private var interactionEndTasks: [String: Task<Void, Never>] = [:]
@@ -186,19 +186,19 @@ final class LiveNodeInteractionCoordinator {
 
     // MARK: - Registration
 
-    /// Registers the async capture handler `LiveNode` will invoke when the
+    /// Registers the async snapshot provider `LiveNode` will invoke when the
     /// node starts ending interaction. Idempotent — a subsequent call replaces
-    /// the previous handler (useful when the capture closure captures
+    /// the previous provider (useful when the closure captures
     /// `self` on a `View` value type whose address changes across body
     /// evaluations).
-    func registerCapture(
+    func registerPosterProvider(
         for nodeID: String,
         handler: @escaping @MainActor () async -> Void
     ) {
-        captureHandlers[nodeID] = handler
+        posterProviders[nodeID] = handler
     }
 
-    /// Clears the capture handler for a node. **Does not** touch
+    /// Clears the snapshot provider for a node. **Does not** touch
     /// `intent`, `renderedInteractive`, or in-flight interaction-end tasks —
     /// `LiveNode`'s `onDisappear` fires for view-tree reasons that are
     /// not actually node interaction ends (viewport cull, transient parent
@@ -211,8 +211,8 @@ final class LiveNodeInteractionCoordinator {
     /// Interaction start/end is owned solely by
     /// ``update(nodeID:intent:)``, which is driven by the predicate
     /// edge.
-    func unregisterCapture(for nodeID: String) {
-        captureHandlers.removeValue(forKey: nodeID)
+    func unregisterPosterProvider(for nodeID: String) {
+        posterProviders.removeValue(forKey: nodeID)
     }
 
     // MARK: - Intent → render-state transitions
@@ -223,7 +223,7 @@ final class LiveNodeInteractionCoordinator {
     /// - `false → true`: cancels any pending interaction end, inserts into
     ///   `renderedInteractive` synchronously.
     /// - `true  → false`: starts an async interaction-end task that awaits
-    ///   the registered capture handler, then removes from
+    ///   the registered snapshot provider, then removes from
     ///   `renderedInteractive` (provided intent is still `false`).
     func update(nodeID: String, intent newIntent: Bool) {
         let previous = intent[nodeID] ?? false
@@ -241,7 +241,7 @@ final class LiveNodeInteractionCoordinator {
             if let task = interactionEndTasks.removeValue(forKey: nodeID) {
                 task.cancel()
             }
-            let handler = captureHandlers[nodeID]
+            let handler = posterProviders[nodeID]
             interactionEndTasks[nodeID] = Task { @MainActor [weak self] in
                 if let handler {
                     await handler()
@@ -317,12 +317,12 @@ private struct LiveNodeInteractionCoordinatorKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    /// The coordinator that `LiveNode` uses to register its capture
-    /// handler with the overlay's interaction-end pipeline. Injected by
+    /// The coordinator that `LiveNode` uses to register its snapshot
+    /// provider with the overlay's interaction-end pipeline. Injected by
     /// `FlowCanvas`; `nil` when a `LiveNode` is rendered outside a
     /// `FlowCanvas` (the rasterize-only preview case), in which case
     /// `LiveNode` skips registration and falls back to best-effort
-    /// capture semantics.
+    /// snapshot semantics.
     var liveNodeInteractionCoordinator: LiveNodeInteractionCoordinator? {
         get { self[LiveNodeInteractionCoordinatorKey.self] }
         set { self[LiveNodeInteractionCoordinatorKey.self] = newValue }
