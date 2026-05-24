@@ -244,6 +244,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
 
         case .live:
             LiveNodeLiveBody(
+                nodeID: environment.id,
                 snapshot: environment.snapshot,
                 mountPolicy: configuration.mountPolicy,
                 size: environment.size,
@@ -281,7 +282,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             guard configuration.posterPolicy.interactionEndCapture == .automatic else {
                 return
             }
-            await refreshSnapshot()
+            await refreshSnapshot(reason: "interactionEnd")
         }
     }
 
@@ -300,6 +301,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         guard snapshotRegistry.hasMountedViewSnapshotProvider else { return }
         guard let snapshotWriter else { return }
 
+        tracePoster("initialCapture start")
         isSeedingInitialSnapshot = true
         defer {
             isSeedingInitialSnapshot = false
@@ -314,31 +316,37 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
 
         hasAttemptedInitialSnapshot = true
         guard let snapshot = await produceSnapshot() else {
+            tracePoster("initialCapture noSnapshot")
             return
         }
         guard !Task.isCancelled else {
             return
         }
         snapshotWriter(environment.id, snapshot)
+        tracePoster("initialCapture wrote")
     }
 
     @MainActor
     @discardableResult
-    private func refreshSnapshot() async -> Bool {
+    private func refreshSnapshot(reason: String) async -> Bool {
         guard let snapshotWriter else { return false }
         guard !Task.isCancelled else {
             return false
         }
+        tracePoster("\(reason) start")
         guard await Self.waitForStablePosterFrame() else {
+            tracePoster("\(reason) cancelledBeforeStableFrame")
             return false
         }
         guard let snapshot = await produceSnapshot() else {
+            tracePoster("\(reason) noSnapshot")
             return false
         }
         guard !Task.isCancelled else {
             return false
         }
         snapshotWriter(environment.id, snapshot)
+        tracePoster("\(reason) wrote")
         return true
     }
 
@@ -375,21 +383,35 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 allowsImmediateSnapshotWrites
             },
             requestPosterUpdate: {
-                guard let handler = registry.preferredSnapshotProvider() else { return }
+                print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest start")
+                guard let handler = registry.preferredSnapshotProvider() else {
+                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest noProvider")
+                    return
+                }
                 guard !Task.isCancelled else {
                     return
                 }
                 guard await Self.waitForStablePosterFrame() else {
+                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest cancelledBeforeStableFrame")
                     return
                 }
                 guard let snapshot = await handler() else {
+                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest noSnapshot")
                     return
                 }
                 guard !Task.isCancelled else {
                     return
                 }
                 snapshotWriter(nodeID, snapshot)
+                print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest wrote")
             }
+        )
+    }
+
+    private func tracePoster(_ event: String) {
+        print(
+            "[SwiftFlow][LiveNodePoster] node=\(environment.id) event=\(event) "
+                + "snapshotMissing=\(environment.snapshot == nil) deferred=\(defersSnapshotWrites)"
         )
     }
 
@@ -431,6 +453,7 @@ private struct RasterizedNodeBody<Placeholder: View>: View {
 // MARK: - Live Body
 
 private struct LiveNodeLiveBody<Content: View>: View {
+    let nodeID: String
     let snapshot: FlowNodeSnapshot?
     let mountPolicy: LiveNodeMountPolicy
     let size: CGSize
@@ -450,6 +473,7 @@ private struct LiveNodeLiveBody<Content: View>: View {
             content()
                 .overlay(alignment: .topLeading) {
                     LiveNodeMountedViewSnapshotHost(
+                        nodeID: nodeID,
                         size: size,
                         scale: scale,
                         registry: snapshotRegistry,

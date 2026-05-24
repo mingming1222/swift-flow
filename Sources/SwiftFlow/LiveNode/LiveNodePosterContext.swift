@@ -85,6 +85,7 @@ public struct LiveNodePosterContext: Sendable {
     @MainActor
     public func requestPosterUpdate() async {
         guard allowsImmediateSnapshotWrites else {
+            print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest skipped=deferred")
             return
         }
         await _requestPosterUpdate()
