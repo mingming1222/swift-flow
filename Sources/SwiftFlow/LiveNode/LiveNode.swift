@@ -210,7 +210,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     @Environment(\.defersLiveNodeSnapshotWrites) private var defersSnapshotWrites
 
     @State private var snapshotRegistry = LiveNodeSnapshotRegistry()
-    @State private var hasSeededInitialSnapshot: Bool = false
+    @State private var hasAttemptedInitialSnapshot: Bool = false
     @State private var isSeedingInitialSnapshot: Bool = false
     @State private var snapshotProviderReadinessRevision: Int = 0
     private var contentContext: LiveNodeContentContext {
@@ -271,7 +271,6 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         InitialSnapshotSeedTrigger(
             nodeID: environment.id,
             isSnapshotMissing: environment.snapshot == nil,
-            defersSnapshotWrites: defersSnapshotWrites,
             readinessRevision: snapshotProviderReadinessRevision
         )
     }
@@ -295,20 +294,32 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     private func seedInitialSnapshotIfNeeded() async {
         guard configuration.posterPolicy.initialCapture == .automatic else { return }
         guard environment.snapshot == nil else { return }
-        guard !hasSeededInitialSnapshot else { return }
+        guard !hasAttemptedInitialSnapshot else { return }
         guard !isSeedingInitialSnapshot else { return }
         guard !defersSnapshotWrites else { return }
         guard snapshotRegistry.hasMountedViewSnapshotProvider else { return }
+        guard let snapshotWriter else { return }
 
         isSeedingInitialSnapshot = true
         defer {
             isSeedingInitialSnapshot = false
         }
 
-        let didWriteSnapshot = await refreshSnapshot()
-        if didWriteSnapshot {
-            hasSeededInitialSnapshot = true
+        guard await Self.waitForStablePosterFrame() else {
+            return
         }
+        guard !Task.isCancelled else {
+            return
+        }
+
+        hasAttemptedInitialSnapshot = true
+        guard let snapshot = await produceSnapshot() else {
+            return
+        }
+        guard !Task.isCancelled else {
+            return
+        }
+        snapshotWriter(environment.id, snapshot)
     }
 
     @MainActor
@@ -397,7 +408,6 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
 private struct InitialSnapshotSeedTrigger: Hashable {
     let nodeID: String
     let isSnapshotMissing: Bool
-    let defersSnapshotWrites: Bool
     let readinessRevision: Int
 }
 
