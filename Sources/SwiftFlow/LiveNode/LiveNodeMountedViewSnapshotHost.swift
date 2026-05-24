@@ -158,21 +158,33 @@ private enum LiveNodeIsolatedSnapshotRenderer {
             return nil
         }
 
-        print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender start size=\(size) scale=\(scale)")
+        let layout = captureLayout(size: size, targetScale: scale)
+
+        print(
+            "[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender start "
+                + "size=\(size) scale=\(layout.targetScale) backingScale=\(layout.backingScale) "
+                + "renderScale=\(layout.renderScale)"
+        )
 
         let hostingView = NSHostingView(
             rootView: content()
                 .frame(width: size.width, height: size.height)
                 .environment(\.self, swiftUIEnvironment)
+                .environment(\.displayScale, layout.targetScale)
                 .environment(\.liveNodePosterContext, nil)
                 .environment(\.defersLiveNodeSnapshotWrites, true)
+                .scaleEffect(layout.renderScale, anchor: .topLeading)
+                .frame(
+                    width: layout.renderSize.width,
+                    height: layout.renderSize.height,
+                    alignment: .topLeading
+                )
         )
-        hostingView.frame = CGRect(origin: .zero, size: size)
+        hostingView.frame = CGRect(origin: .zero, size: layout.renderSize)
         hostingView.wantsLayer = true
 
-        let windowFrame = captureFrame(size: size)
         let window = NSWindow(
-            contentRect: windowFrame,
+            contentRect: layout.windowFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -200,7 +212,7 @@ private enum LiveNodeIsolatedSnapshotRenderer {
         }
 
         do {
-            let snapshot = try await captureWindow(window, nodeID: nodeID, size: size, scale: scale)
+            let snapshot = try await captureWindow(window, nodeID: nodeID, size: size, scale: layout.targetScale)
             print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender captured")
             return snapshot
         } catch {
@@ -209,9 +221,35 @@ private enum LiveNodeIsolatedSnapshotRenderer {
         }
     }
 
-    private static func captureFrame(size: CGSize) -> CGRect {
-        let screenFrame = (NSScreen.main ?? NSScreen.screens.first)?.frame
-            ?? CGRect(origin: .zero, size: size)
+    private struct CaptureLayout {
+        let targetScale: CGFloat
+        let backingScale: CGFloat
+        let renderScale: CGFloat
+        let renderSize: CGSize
+        let windowFrame: CGRect
+    }
+
+    private static func captureLayout(size: CGSize, targetScale: CGFloat) -> CaptureLayout {
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let backingScale = max(1, screen?.backingScaleFactor ?? 1)
+        let targetScale = max(1, targetScale)
+        let renderScale = max(1, targetScale / backingScale)
+        let renderSize = CGSize(
+            width: max(1, (size.width * renderScale).rounded(.up)),
+            height: max(1, (size.height * renderScale).rounded(.up))
+        )
+
+        return CaptureLayout(
+            targetScale: targetScale,
+            backingScale: backingScale,
+            renderScale: renderScale,
+            renderSize: renderSize,
+            windowFrame: captureFrame(size: renderSize, screen: screen)
+        )
+    }
+
+    private static func captureFrame(size: CGSize, screen: NSScreen?) -> CGRect {
+        let screenFrame = screen?.frame ?? CGRect(origin: .zero, size: size)
         let width = max(1, size.width.rounded(.up))
         let height = max(1, size.height.rounded(.up))
         let originX = screenFrame.minX + max(0, (screenFrame.width - width) / 2)
