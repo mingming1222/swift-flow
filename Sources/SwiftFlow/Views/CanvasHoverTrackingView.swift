@@ -7,12 +7,16 @@ struct CanvasHoverTrackingView: NSViewRepresentable {
     let onHover: @MainActor (CGPoint) -> Void
     let onExit: @MainActor () -> Void
     let cursorAt: @MainActor (CGPoint) -> NSCursor
+    let onMagnify: @MainActor (CGFloat, CGPoint) -> Void
+    let shouldHandleViewportMagnify: @MainActor (CGPoint) -> Bool
 
     func makeNSView(context: Context) -> CanvasHoverTrackingNSView {
         let view = CanvasHoverTrackingNSView()
         view.onHover = onHover
         view.onExit = onExit
         view.cursorAt = cursorAt
+        view.onMagnify = onMagnify
+        view.shouldHandleViewportMagnify = shouldHandleViewportMagnify
         return view
     }
 
@@ -20,6 +24,8 @@ struct CanvasHoverTrackingView: NSViewRepresentable {
         nsView.onHover = onHover
         nsView.onExit = onExit
         nsView.cursorAt = cursorAt
+        nsView.onMagnify = onMagnify
+        nsView.shouldHandleViewportMagnify = shouldHandleViewportMagnify
     }
 }
 
@@ -28,8 +34,26 @@ final class CanvasHoverTrackingNSView: NSView {
     var onHover: (@MainActor (CGPoint) -> Void)?
     var onExit: (@MainActor () -> Void)?
     var cursorAt: (@MainActor (CGPoint) -> NSCursor)?
+    var onMagnify: (@MainActor (CGFloat, CGPoint) -> Void)?
+    var shouldHandleViewportMagnify: (@MainActor (CGPoint) -> Bool)?
 
     private var trackingArea: NSTrackingArea?
+    private var magnifyMonitor: Any?
+
+    deinit {
+        MainActor.assumeIsolated {
+            removeEventMonitors()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            removeEventMonitors()
+        } else {
+            installEventMonitorsIfNeeded()
+        }
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
@@ -69,6 +93,47 @@ final class CanvasHoverTrackingNSView: NSView {
         MainActor.assumeIsolated {
             onExit?()
         }
+    }
+
+    private func installEventMonitorsIfNeeded() {
+        if magnifyMonitor == nil {
+            magnifyMonitor = NSEvent.addLocalMonitorForEvents(matching: .magnify) { [weak self] event in
+                self?.handleViewportMagnify(event) ?? event
+            }
+        }
+    }
+
+    private func removeEventMonitors() {
+        if let magnifyMonitor {
+            NSEvent.removeMonitor(magnifyMonitor)
+            self.magnifyMonitor = nil
+        }
+    }
+
+    private func handleViewportMagnify(_ event: NSEvent) -> NSEvent? {
+        guard let location = viewportMagnifyLocation(from: event) else {
+            return event
+        }
+
+        MainActor.assumeIsolated {
+            onMagnify?(event.magnification, location)
+        }
+        return nil
+    }
+
+    private func viewportMagnifyLocation(from event: NSEvent) -> CGPoint? {
+        guard event.window === window else {
+            return nil
+        }
+        let location = flippedLocation(from: event)
+        guard bounds.contains(CGPoint(x: location.x, y: bounds.height - location.y)) else {
+            return nil
+        }
+        var shouldHandle = false
+        MainActor.assumeIsolated {
+            shouldHandle = shouldHandleViewportMagnify?(location) ?? false
+        }
+        return shouldHandle ? location : nil
     }
 
     private func updateHoverAndCursor(for event: NSEvent) {

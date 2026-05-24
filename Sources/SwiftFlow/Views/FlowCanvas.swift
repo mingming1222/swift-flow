@@ -476,6 +476,16 @@ public struct FlowCanvas<
                 },
                 cursorAt: { location in
                     cursor(at: location)
+                },
+                onMagnify: { magnification, location in
+                    beginViewportInteraction()
+                    store.zoom(by: 1 + magnification, anchor: location)
+                    scheduleEndViewportInteraction()
+                },
+                shouldHandleViewportMagnify: { location in
+                    let canvasPoint = store.viewport.screenToCanvas(location)
+                    return store.hitTestNode(at: canvasPoint) == nil
+                        && store.hitTestHandle(at: canvasPoint) == nil
                 }
             )
             .frame(width: size.width, height: size.height)
