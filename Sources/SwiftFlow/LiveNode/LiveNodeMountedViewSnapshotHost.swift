@@ -170,8 +170,9 @@ private enum LiveNodeIsolatedSnapshotRenderer {
         hostingView.frame = CGRect(origin: .zero, size: size)
         hostingView.wantsLayer = true
 
+        let windowFrame = captureFrame(size: size)
         let window = NSWindow(
-            contentRect: offscreenFrame(size: size),
+            contentRect: windowFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -183,8 +184,8 @@ private enum LiveNodeIsolatedSnapshotRenderer {
         window.isOpaque = false
         window.hasShadow = false
         window.ignoresMouseEvents = true
-        window.level = .normal
-        window.collectionBehavior = [.ignoresCycle, .stationary]
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
+        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .stationary]
         window.orderFrontRegardless()
         defer {
             window.orderOut(nil)
@@ -208,13 +209,18 @@ private enum LiveNodeIsolatedSnapshotRenderer {
         }
     }
 
-    private static func offscreenFrame(size: CGSize) -> CGRect {
-        let screenFrame = NSScreen.screens.first?.frame ?? .zero
+    private static func captureFrame(size: CGSize) -> CGRect {
+        let screenFrame = (NSScreen.main ?? NSScreen.screens.first)?.frame
+            ?? CGRect(origin: .zero, size: size)
+        let width = max(1, size.width.rounded(.up))
+        let height = max(1, size.height.rounded(.up))
+        let originX = screenFrame.minX + max(0, (screenFrame.width - width) / 2)
+        let originY = screenFrame.minY + max(0, (screenFrame.height - height) / 2)
         return CGRect(
-            x: screenFrame.maxX + 4096,
-            y: screenFrame.maxY + 4096,
-            width: size.width,
-            height: size.height
+            x: originX,
+            y: originY,
+            width: width,
+            height: height
         )
     }
 
