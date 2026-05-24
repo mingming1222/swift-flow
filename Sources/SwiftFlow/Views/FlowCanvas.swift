@@ -408,7 +408,14 @@ public struct FlowCanvas<
         #if os(macOS)
         let hostView = CanvasHostView(
             onScroll: { delta, location in
-                guard store.configuration.panEnabled else { return }
+                let wasViewportInteracting = isViewportInteracting
+                guard store.configuration.panEnabled else {
+                    logCanvasScrollIgnored(delta: delta, location: location, canvasSize: size, reason: "panDisabled")
+                    return
+                }
+                if !wasViewportInteracting {
+                    logCanvasScrollPanStart(delta: delta, location: location, canvasSize: size)
+                }
                 beginViewportInteraction()
                 store.pan(by: delta)
                 scheduleEndViewportInteraction()
@@ -1088,6 +1095,42 @@ public struct FlowCanvas<
     }
 
     #if os(macOS)
+    private func logCanvasScrollPanStart(delta: CGSize, location: CGPoint, canvasSize: CGSize) {
+        let canvasPoint = store.viewport.screenToCanvas(location)
+        print(
+            "[SwiftFlow][CanvasScroll] source=flow event=panStart "
+                + "location=\(formatCanvasScrollPoint(location)) "
+                + "canvas=\(formatCanvasScrollPoint(canvasPoint)) "
+                + "delta=\(formatCanvasScrollSize(delta)) "
+                + "viewportOffset=\(formatCanvasScrollPoint(store.viewport.offset)) "
+                + "zoom=\(formatCanvasScrollNumber(store.viewport.zoom)) "
+                + "canvasSize=\(formatCanvasScrollSize(canvasSize))"
+        )
+    }
+
+    private func logCanvasScrollIgnored(delta: CGSize, location: CGPoint, canvasSize: CGSize, reason: String) {
+        let canvasPoint = store.viewport.screenToCanvas(location)
+        print(
+            "[SwiftFlow][CanvasScroll] source=flow event=ignored reason=\(reason) "
+                + "location=\(formatCanvasScrollPoint(location)) "
+                + "canvas=\(formatCanvasScrollPoint(canvasPoint)) "
+                + "delta=\(formatCanvasScrollSize(delta)) "
+                + "canvasSize=\(formatCanvasScrollSize(canvasSize))"
+        )
+    }
+
+    private func formatCanvasScrollPoint(_ point: CGPoint) -> String {
+        "(\(formatCanvasScrollNumber(point.x)), \(formatCanvasScrollNumber(point.y)))"
+    }
+
+    private func formatCanvasScrollSize(_ size: CGSize) -> String {
+        "(\(formatCanvasScrollNumber(size.width)), \(formatCanvasScrollNumber(size.height)))"
+    }
+
+    private func formatCanvasScrollNumber(_ value: CGFloat) -> String {
+        String(format: "%.1f", Double(value))
+    }
+
     private func updateHover(at location: CGPoint, source: String) {
         let canvasPoint = store.viewport.screenToCanvas(location)
         let nodeID = store.hitTestNode(at: canvasPoint)

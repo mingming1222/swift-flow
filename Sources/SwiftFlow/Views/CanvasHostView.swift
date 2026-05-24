@@ -69,6 +69,9 @@ final class CanvasNSHostView<Content: View>: NSView {
     var onKeyDown: (@MainActor (UInt16) -> Bool)?
 
     private var currentDropTypes: [String] = []
+    private var isScrollSequenceActive = false
+    private var lastScrollEventTimestamp: TimeInterval = 0
+    private var scrollSequenceID = 0
 
     func updateRegisteredTypes(_ types: [String]) {
         guard types != currentDropTypes else { return }
@@ -148,9 +151,11 @@ final class CanvasNSHostView<Content: View>: NSView {
             dy = event.scrollingDeltaY * 10
         }
         let location = flippedLocation(from: event)
+        logScrollStartIfNeeded(event: event, delta: CGSize(width: dx, height: dy), location: location)
         MainActor.assumeIsolated {
             onScroll?(CGSize(width: dx, height: dy), location)
         }
+        updateScrollSequenceState(event: event)
     }
 
     func handleMagnify(_ event: NSEvent) {
@@ -217,6 +222,63 @@ final class CanvasNSHostView<Content: View>: NSView {
         guard let window else { return false }
         let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         return bounds.contains(location)
+    }
+
+    private func logScrollStartIfNeeded(event: NSEvent, delta: CGSize, location: CGPoint) {
+        if isScrollSequenceActive, event.timestamp - lastScrollEventTimestamp > 0.2 {
+            isScrollSequenceActive = false
+        }
+        lastScrollEventTimestamp = event.timestamp
+
+        let hasDelta = delta.width != 0 || delta.height != 0
+        let phase = event.phase
+        let momentumPhase = event.momentumPhase
+        let startsByPhase = phase.contains(.began) || phase.contains(.mayBegin)
+        let startsByFallback = !isScrollSequenceActive && hasDelta && momentumPhase.isEmpty
+        guard startsByPhase || startsByFallback else { return }
+
+        isScrollSequenceActive = true
+        scrollSequenceID += 1
+        print(
+            "[SwiftFlow][CanvasScroll] source=host event=start id=\(scrollSequenceID) "
+                + "location=\(formatPoint(location)) windowLocation=\(formatPoint(event.locationInWindow)) "
+                + "delta=\(formatSize(delta)) phase=\(formatPhase(phase)) "
+                + "momentum=\(formatPhase(momentumPhase)) precise=\(event.hasPreciseScrollingDeltas) "
+                + "bounds=\(formatSize(bounds.size))"
+        )
+    }
+
+    private func updateScrollSequenceState(event: NSEvent) {
+        let ended = event.phase.contains(.ended)
+            || event.phase.contains(.cancelled)
+            || event.momentumPhase.contains(.ended)
+            || event.momentumPhase.contains(.cancelled)
+        if ended {
+            isScrollSequenceActive = false
+        }
+    }
+
+    private func formatPhase(_ phase: NSEvent.Phase) -> String {
+        var parts: [String] = []
+        if phase.contains(.mayBegin) { parts.append("mayBegin") }
+        if phase.contains(.began) { parts.append("began") }
+        if phase.contains(.stationary) { parts.append("stationary") }
+        if phase.contains(.changed) { parts.append("changed") }
+        if phase.contains(.ended) { parts.append("ended") }
+        if phase.contains(.cancelled) { parts.append("cancelled") }
+        return parts.isEmpty ? "none" : parts.joined(separator: "|")
+    }
+
+    private func formatPoint(_ point: CGPoint) -> String {
+        "(\(formatNumber(point.x)), \(formatNumber(point.y)))"
+    }
+
+    private func formatSize(_ size: CGSize) -> String {
+        "(\(formatNumber(size.width)), \(formatNumber(size.height)))"
+    }
+
+    private func formatNumber(_ value: CGFloat) -> String {
+        String(format: "%.1f", Double(value))
     }
 
     private func flippedLocation(from sender: any NSDraggingInfo) -> CGPoint {
