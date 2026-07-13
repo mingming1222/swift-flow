@@ -440,6 +440,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
 
     /// Drop every cached snapshot. Useful when bulk-reloading a document.
     public func clearAllNodeSnapshots() {
+        snapshotGeneration += 1
         nodeSnapshots.removeAll(keepingCapacity: false)
     }
 

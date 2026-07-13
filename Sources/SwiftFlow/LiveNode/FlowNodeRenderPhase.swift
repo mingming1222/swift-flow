@@ -54,6 +54,14 @@ private struct DefersLiveNodeSnapshotWritesKey: EnvironmentKey {
     static let defaultValue: Bool = false
 }
 
+private struct IsLiveNodeSurfaceVisibleKey: EnvironmentKey {
+    static let defaultValue: Bool = false
+}
+
+private struct LiveNodeSnapshotDisplayScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
 extension EnvironmentValues {
     /// Which dual-phase rendering pass is currently evaluating a
     /// `nodeContent` closure. See ``FlowNodeRenderPhase`` for the
@@ -210,5 +218,20 @@ extension EnvironmentValues {
     var defersLiveNodeSnapshotWrites: Bool {
         get { self[DefersLiveNodeSnapshotWritesKey.self] }
         set { self[DefersLiveNodeSnapshotWritesKey.self] = newValue }
+    }
+
+    /// `true` while the mounted LiveNode subtree is the visible source that
+    /// a platform snapshot provider is allowed to capture.
+    var isLiveNodeSurfaceVisible: Bool {
+        get { self[IsLiveNodeSurfaceVisibleKey.self] }
+        set { self[IsLiveNodeSurfaceVisibleKey.self] = newValue }
+    }
+
+    /// Physical display scale used for poster capture. The live overlay may
+    /// raise SwiftUI's rendering scale to keep zoomed text sharp, but poster
+    /// pixels remain canonical to the actual display.
+    var liveNodeSnapshotDisplayScale: CGFloat? {
+        get { self[LiveNodeSnapshotDisplayScaleKey.self] }
+        set { self[LiveNodeSnapshotDisplayScaleKey.self] = newValue }
     }
 }

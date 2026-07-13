@@ -25,8 +25,8 @@ import SwiftUI
 ///    overlay opacity remains 1, Canvas skip remains in effect
 /// 3. Coordinator awaits the registered snapshot provider
 /// 4. Snapshot writes fresh snapshot to the store
-/// 5. `renderedInteractive` flips to `false`, overlay fades, Canvas now draws
-///    the fresh snapshot as the first visible frame
+/// 5. On capture success, `renderedInteractive` flips to `false`, overlay
+///    fades, and Canvas draws the fresh snapshot as the first visible frame
 ///
 /// If the user re-hovers during step 3 the in-flight interaction-end task is
 /// cancelled and `renderedInteractive` stays `true` throughout — no flicker.
@@ -85,7 +85,7 @@ final class LiveNodeInteractionCoordinator {
     private var intent: [String: Bool] = [:]
 
     /// Snapshot providers registered by `LiveNode` per snapshot mode.
-    private var posterProviders: [String: @MainActor () async -> Void] = [:]
+    private var posterProviders: [String: @MainActor () async -> Bool] = [:]
 
     /// In-flight interaction-end tasks keyed by node ID.
     private var interactionEndTasks: [String: Task<Void, Never>] = [:]
@@ -193,7 +193,7 @@ final class LiveNodeInteractionCoordinator {
     /// evaluations).
     func registerPosterProvider(
         for nodeID: String,
-        handler: @escaping @MainActor () async -> Void
+        handler: @escaping @MainActor () async -> Bool
     ) {
         posterProviders[nodeID] = handler
     }
@@ -224,12 +224,12 @@ final class LiveNodeInteractionCoordinator {
     ///   `renderedInteractive` synchronously.
     /// - `true  → false`: starts an async interaction-end task that awaits
     ///   the registered snapshot provider, then removes from
-    ///   `renderedInteractive` (provided intent is still `false`).
+    ///   `renderedInteractive` only when capture succeeded and intent is
+    ///   still `false`.
     func update(nodeID: String, intent newIntent: Bool) {
         let previous = intent[nodeID] ?? false
         intent[nodeID] = newIntent
         guard previous != newIntent else { return }
-
 
         if newIntent {
             if let task = interactionEndTasks.removeValue(forKey: nodeID) {
@@ -243,8 +243,11 @@ final class LiveNodeInteractionCoordinator {
             }
             let handler = posterProviders[nodeID]
             interactionEndTasks[nodeID] = Task { @MainActor [weak self] in
+                let didCapture: Bool
                 if let handler {
-                    await handler()
+                    didCapture = await handler()
+                } else {
+                    didCapture = true
                 }
                 guard let self else { return }
                 if Task.isCancelled {
@@ -253,7 +256,7 @@ final class LiveNodeInteractionCoordinator {
                 // Confirm the user didn't re-hover while capturing; if
                 // they did, a later `update(... intent: true)` already
                 // cancelled this task and we would have returned above.
-                if self.intent[nodeID] == false {
+                if didCapture, self.intent[nodeID] == false {
                     self.renderedInteractive.remove(nodeID)
                 }
                 self.interactionEndTasks.removeValue(forKey: nodeID)
@@ -276,38 +279,6 @@ final class LiveNodeInteractionCoordinator {
         liveNodeMountPolicies[nodeID] ?? .onInteraction
     }
 
-    /// Whether the Canvas's rasterize path should skip this node because
-    /// the overlay is currently drawing a live view for it. Plain
-    /// (non-live) rows answer `false` even when hovered or selected, so
-    /// Canvas keeps drawing them — otherwise the node would disappear
-    /// the instant the user moves the cursor over it.
-    ///
-    /// **Poster pattern**: every LiveNode (regardless of mount policy)
-    /// is drawn by the Canvas as a snapshot poster while not interactive, and
-    /// only swaps to the live overlay view while the interaction predicate
-    /// returns true. By default that means the user is hovering the node.
-    /// ``LiveNodeMountPolicy/persistent`` differs
-    /// from ``LiveNodeMountPolicy/onInteraction`` only in **mount**
-    /// behaviour — the underlying native view stays in the SwiftUI
-    /// tree so its CARemoteLayer pipeline doesn't stall — not in
-    /// **drawing** behaviour. That is why this method ignores mount
-    /// policy and answers solely on `renderedInteractive`.
-    func overlayIsDrawing(_ nodeID: String) -> Bool {
-        guard liveNodeIDs.contains(nodeID) else { return false }
-        return renderedInteractive.contains(nodeID)
-    }
-
-    /// Whether the overlay row should accept hit-testing. Distinct from
-    /// ``overlayIsDrawing(_:)`` because `.persistent` rows stay drawn
-    /// (opacity 1) the whole time they are mounted, but their underlying
-    /// `WKWebView` / `MKMapView` should only intercept scroll / click
-    /// while the user is actually interacting with the node. When the
-    /// row is not interactive, hit-testing is off so a click passes through
-    /// to Canvas — letting the Canvas continue to own selection and drag
-    /// gestures while the node is not live.
-    func overlayIsHittable(_ nodeID: String) -> Bool {
-        liveNodeIDs.contains(nodeID) && renderedInteractive.contains(nodeID)
-    }
 }
 
 // MARK: - Environment

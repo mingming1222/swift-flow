@@ -183,13 +183,19 @@ final class LiveNodeSnapshotRegistry {
         mountedViewHandler
     }
 
-    func preferredSnapshotProvider() -> (@MainActor () async -> FlowNodeSnapshot?)? {
-        nativeHandler ?? mountedViewHandler
+    func preferredSnapshotProvider(
+        allowsMountedView: Bool
+    ) -> (@MainActor () async -> FlowNodeSnapshot?)? {
+        if let nativeHandler {
+            return nativeHandler
+        }
+        return allowsMountedView ? mountedViewHandler : nil
     }
 
     var hasMountedViewSnapshotProvider: Bool {
         mountedViewHandler != nil
     }
+
 }
 
 // MARK: - Core
@@ -204,13 +210,13 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     @Environment(\.flowNodeRenderPhase) private var phase
     @Environment(\.isFlowNodeInteractive) private var isInteractive
     @Environment(\.displayScale) private var displayScale
-    @Environment(\.self) private var swiftUIEnvironment
+    @Environment(\.liveNodeSnapshotDisplayScale) private var snapshotDisplayScale
     @Environment(\.flowLiveNodeSnapshotWriter) private var snapshotWriter
     @Environment(\.liveNodeInteractionCoordinator) private var coordinator
     @Environment(\.defersLiveNodeSnapshotWrites) private var defersSnapshotWrites
+    @Environment(\.isLiveNodeSurfaceVisible) private var isLiveNodeSurfaceVisible
 
     @State private var snapshotRegistry = LiveNodeSnapshotRegistry()
-    @State private var hasAttemptedInitialSnapshot: Bool = false
     @State private var isSeedingInitialSnapshot: Bool = false
     @State private var snapshotProviderReadinessRevision: Int = 0
     private var contentContext: LiveNodeContentContext {
@@ -249,8 +255,8 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 mountPolicy: configuration.mountPolicy,
                 size: environment.size,
                 scale: snapshotScale,
+                isSurfaceVisible: isLiveNodeSurfaceVisible,
                 snapshotRegistry: snapshotRegistry,
-                swiftUIEnvironment: swiftUIEnvironment,
                 snapshotProviderReady: {
                     snapshotProviderReadinessRevision += 1
                 },
@@ -272,7 +278,9 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         InitialSnapshotSeedTrigger(
             nodeID: environment.id,
             isSnapshotMissing: environment.snapshot == nil,
-            readinessRevision: snapshotProviderReadinessRevision
+            readinessRevision: snapshotProviderReadinessRevision,
+            scale: snapshotScale,
+            isSurfaceVisible: isLiveNodeSurfaceVisible
         )
     }
 
@@ -280,9 +288,9 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     private func registerInteractionEndSnapshotProvider() {
         coordinator?.registerPosterProvider(for: environment.id) {
             guard configuration.posterPolicy.interactionEndCapture == .automatic else {
-                return
+                return true
             }
-            await refreshSnapshot(reason: "interactionEnd")
+            return await refreshSnapshot(reason: "interactionEnd")
         }
     }
 
@@ -295,11 +303,11 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     private func seedInitialSnapshotIfNeeded() async {
         guard configuration.posterPolicy.initialCapture == .automatic else { return }
         guard environment.snapshot == nil else { return }
-        guard !hasAttemptedInitialSnapshot else { return }
         guard !isSeedingInitialSnapshot else { return }
         guard !defersSnapshotWrites else { return }
+        guard isLiveNodeSurfaceVisible else { return }
         guard snapshotRegistry.hasMountedViewSnapshotProvider else { return }
-        guard let snapshotWriter else { return }
+        guard snapshotWriter != nil else { return }
 
         tracePoster("initialCapture start")
         isSeedingInitialSnapshot = true
@@ -307,34 +315,32 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             isSeedingInitialSnapshot = false
         }
 
-        guard await Self.waitForStablePosterFrame() else {
-            return
+        let delays: [UInt64] = [50_000_000, 100_000_000, 200_000_000]
+        for (attempt, delay) in delays.enumerated() {
+            guard await Self.waitForStablePosterFrame(delay: delay) else { return }
+            guard !Task.isCancelled else { return }
+            guard let snapshot = await produceSnapshot() else {
+                tracePoster("initialCapture attempt=\(attempt + 1) noSnapshot")
+                continue
+            }
+            guard !Task.isCancelled else { return }
+            if storeSnapshot(snapshot, reason: "initialCapture") {
+                tracePoster("initialCapture wrote")
+                return
+            }
         }
-        guard !Task.isCancelled else {
-            return
-        }
-
-        hasAttemptedInitialSnapshot = true
-        guard let snapshot = await produceSnapshot() else {
-            tracePoster("initialCapture noSnapshot")
-            return
-        }
-        guard !Task.isCancelled else {
-            return
-        }
-        snapshotWriter(environment.id, snapshot)
-        tracePoster("initialCapture wrote")
+        tracePoster("initialCapture exhausted")
     }
 
     @MainActor
     @discardableResult
     private func refreshSnapshot(reason: String) async -> Bool {
-        guard let snapshotWriter else { return false }
+        guard snapshotWriter != nil else { return false }
         guard !Task.isCancelled else {
             return false
         }
         tracePoster("\(reason) start")
-        guard await Self.waitForStablePosterFrame() else {
+        guard await Self.waitForStablePosterFrame(delay: 50_000_000) else {
             tracePoster("\(reason) cancelledBeforeStableFrame")
             return false
         }
@@ -345,33 +351,106 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         guard !Task.isCancelled else {
             return false
         }
-        snapshotWriter(environment.id, snapshot)
-        tracePoster("\(reason) wrote")
-        return true
+        do {
+            try LiveNodeSnapshotQuality.validate(
+                snapshot,
+                logicalSize: environment.size,
+                requiredScale: snapshotScale
+            )
+        } catch let error as LiveNodeSnapshotCaptureError {
+            if case .insufficientResolution = error,
+               environment.snapshot != nil {
+                tracePoster("\(reason) retainedExistingPoster \(error)")
+                return true
+            }
+            let failure = LiveNodeSnapshotFailure(
+                nodeID: environment.id,
+                stage: .normalization,
+                underlyingError: error
+            )
+            tracePoster("\(reason) failed \(failure)")
+            return false
+        } catch {
+            let failure = LiveNodeSnapshotFailure(
+                nodeID: environment.id,
+                stage: .normalization,
+                underlyingError: error
+            )
+            tracePoster("\(reason) failed \(failure)")
+            return false
+        }
+        let didStore = storeSnapshot(snapshot, reason: reason)
+        if didStore {
+            tracePoster("\(reason) wrote")
+        }
+        return didStore
     }
 
     @MainActor
     private func produceSnapshot() async -> FlowNodeSnapshot? {
-        guard let handler = snapshotRegistry.preferredSnapshotProvider() else {
+        guard let handler = snapshotRegistry.preferredSnapshotProvider(
+            allowsMountedView: isLiveNodeSurfaceVisible
+        ) else {
             return nil
         }
         return await handler()
     }
 
     private var snapshotScale: CGFloat {
-        min(max(displayScale * 2, 2), 4)
+        max(snapshotDisplayScale ?? displayScale, 1)
+    }
+
+    @MainActor
+    private func storeSnapshot(_ snapshot: FlowNodeSnapshot, reason: String) -> Bool {
+        guard let snapshotWriter else { return false }
+        do {
+            let normalized = try LiveNodeSnapshotQuality.normalize(
+                snapshot,
+                logicalSize: environment.size,
+                scale: snapshotScale
+            )
+            snapshotWriter(environment.id, normalized)
+            return true
+        } catch {
+            let failure = LiveNodeSnapshotFailure(
+                nodeID: environment.id,
+                stage: .normalization,
+                underlyingError: error
+            )
+            tracePoster("\(reason) failed \(failure)")
+            return false
+        }
     }
 
     @MainActor
     private func makePosterContext() -> LiveNodePosterContext? {
         guard let snapshotWriter else { return nil }
         let nodeID = environment.id
+        let logicalSize = environment.size
+        let scale = snapshotScale
         let registry = snapshotRegistry
         let allowsImmediateSnapshotWrites = !defersSnapshotWrites
+        let allowsMountedViewSnapshot = isLiveNodeSurfaceVisible
         return LiveNodePosterContext(
             nodeID: nodeID,
             write: { snapshot in
-                snapshotWriter(nodeID, snapshot)
+                do {
+                    let normalized = try LiveNodeSnapshotQuality.normalize(
+                        snapshot,
+                        logicalSize: logicalSize,
+                        scale: scale
+                    )
+                    snapshotWriter(nodeID, normalized)
+                } catch {
+                    let failure = LiveNodeSnapshotFailure(
+                        nodeID: nodeID,
+                        stage: .normalization,
+                        underlyingError: error
+                    )
+                    print(
+                        "[SwiftFlow][LiveNodePoster] event=directWrite failed \(failure)"
+                    )
+                }
             },
             registerPosterProvider: { handler in
                 registry.setNativeSnapshotProvider(handler)
@@ -384,14 +463,19 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             },
             requestPosterUpdate: {
                 print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest start")
-                guard let handler = registry.preferredSnapshotProvider() else {
-                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest noProvider")
+                guard let handler = registry.preferredSnapshotProvider(
+                    allowsMountedView: allowsMountedViewSnapshot
+                ) else {
+                    let reason = registry.hasMountedViewSnapshotProvider
+                        ? "surfaceNotVisible"
+                        : "noProvider"
+                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest \(reason)")
                     return
                 }
                 guard !Task.isCancelled else {
                     return
                 }
-                guard await Self.waitForStablePosterFrame() else {
+                guard await Self.waitForStablePosterFrame(delay: 50_000_000) else {
                     print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest cancelledBeforeStableFrame")
                     return
                 }
@@ -402,8 +486,24 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 guard !Task.isCancelled else {
                     return
                 }
-                snapshotWriter(nodeID, snapshot)
-                print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest wrote")
+                do {
+                    let normalized = try LiveNodeSnapshotQuality.normalize(
+                        snapshot,
+                        logicalSize: logicalSize,
+                        scale: scale
+                    )
+                    snapshotWriter(nodeID, normalized)
+                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest wrote")
+                } catch {
+                    let failure = LiveNodeSnapshotFailure(
+                        nodeID: nodeID,
+                        stage: .normalization,
+                        underlyingError: error
+                    )
+                    print(
+                        "[SwiftFlow][LiveNodePoster] event=explicitRequest failed \(failure)"
+                    )
+                }
             }
         )
     }
@@ -416,9 +516,9 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     }
 
     @MainActor
-    private static func waitForStablePosterFrame() async -> Bool {
+    private static func waitForStablePosterFrame(delay: UInt64) async -> Bool {
         do {
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await Task.sleep(nanoseconds: delay)
         } catch {
             return false
         }
@@ -431,6 +531,8 @@ private struct InitialSnapshotSeedTrigger: Hashable {
     let nodeID: String
     let isSnapshotMissing: Bool
     let readinessRevision: Int
+    let scale: CGFloat
+    let isSurfaceVisible: Bool
 }
 
 // MARK: - Rasterized Body
@@ -458,8 +560,8 @@ private struct LiveNodeLiveBody<Content: View>: View {
     let mountPolicy: LiveNodeMountPolicy
     let size: CGSize
     let scale: CGFloat
+    let isSurfaceVisible: Bool
     let snapshotRegistry: LiveNodeSnapshotRegistry
-    let swiftUIEnvironment: EnvironmentValues
     let snapshotProviderReady: () -> Void
     let content: () -> Content
 
@@ -476,10 +578,9 @@ private struct LiveNodeLiveBody<Content: View>: View {
                         nodeID: nodeID,
                         size: size,
                         scale: scale,
+                        isSurfaceVisible: isSurfaceVisible,
                         registry: snapshotRegistry,
-                        swiftUIEnvironment: swiftUIEnvironment,
-                        snapshotProviderReady: snapshotProviderReady,
-                        content: content
+                        snapshotProviderReady: snapshotProviderReady
                     )
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)

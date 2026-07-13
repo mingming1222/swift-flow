@@ -68,8 +68,8 @@ struct LiveMapNodeDiagnostics: Sendable, Hashable {
 /// - Mount policy is ``LiveNodeMountPolicy/persistent``: MapKit's native
 ///   renderer stays mounted across interaction changes, while the Canvas
 ///   still draws the poster when the node is idle.
-/// - SwiftFlow's standard mounted bitmap capture owns poster generation.
-///   The map wrapper does not register a MapKit-specific poster provider.
+/// - `MKMapSnapshotter` reads the mounted map's current region and rendering
+///   configuration without relying on Screen Recording permission.
 /// - Region persistence is read/write through the user-supplied
 ///   ``LiveMapNodeStateStore`` so pan/zoom survives real teardown.
 /// - Tile pipeline kick: window-attach callback + hover-driven non-zero
@@ -163,6 +163,8 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 
     private var allowsRegionPersistence = false
 
+    private var posterContext: LiveNodePosterContext?
+
     init(
         nodeID: String,
         initialRegion: MKCoordinateRegion,
@@ -199,9 +201,30 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
     }
 
     func tearDown() {
+        posterContext?.unregisterPosterProvider()
+        posterContext = nil
         interactionKickTask?.cancel()
         interactionKickTask = nil
         wasInteractive = false
+    }
+
+    func bindPosterProvider(
+        mapView: MKMapView,
+        posterContext: LiveNodePosterContext?,
+        snapshotScale: CGFloat
+    ) {
+        self.posterContext?.unregisterPosterProvider()
+        self.posterContext = posterContext
+        guard let posterContext else { return }
+        let nodeID = posterContext.nodeID
+        posterContext.registerPosterProvider { [weak mapView] in
+            guard let mapView else { return nil }
+            return await Self.snapshot(
+                mapView: mapView,
+                nodeID: nodeID,
+                scale: snapshotScale
+            )
+        }
     }
 
     private func scheduleInteractionKick(for mapView: MKMapView) {
@@ -258,6 +281,93 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
         mapView.setRegion(region, animated: false)
     }
 
+    private static func snapshot(
+        mapView: MKMapView,
+        nodeID: String,
+        scale: CGFloat
+    ) async -> FlowNodeSnapshot? {
+        let bounds = mapView.bounds
+        guard bounds.width > 1, bounds.height > 1 else {
+            traceSnapshotFailure(
+                nodeID: nodeID,
+                error: LiveNodeSnapshotCaptureError.invalidLogicalSize(bounds.size)
+            )
+            return nil
+        }
+
+        let options = MKMapSnapshotter.Options()
+        options.region = mapView.region
+        options.preferredConfiguration = mapView.preferredConfiguration
+        options.size = bounds.size
+#if os(iOS)
+        options.traitCollection = mapView.traitCollection.modifyingTraits { traits in
+            traits.displayScale = scale
+        }
+#elseif os(macOS)
+        options.appearance = mapView.effectiveAppearance
+#endif
+
+        let snapshotter = MKMapSnapshotter(options: options)
+        do {
+            let flowSnapshot = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<FlowNodeSnapshot, Error>) in
+                snapshotter.start { snapshot, error in
+                    if let snapshot {
+#if os(iOS)
+                        guard let cgImage = snapshot.image.cgImage else {
+                            continuation.resume(
+                                throwing: LiveNodeSnapshotCaptureError.imageUnavailable
+                            )
+                            return
+                        }
+#elseif os(macOS)
+                        var proposedRect = CGRect(
+                            origin: .zero,
+                            size: snapshot.image.size
+                        )
+                        guard let cgImage = snapshot.image.cgImage(
+                            forProposedRect: &proposedRect,
+                            context: nil,
+                            hints: nil
+                        ) else {
+                            continuation.resume(
+                                throwing: LiveNodeSnapshotCaptureError.imageUnavailable
+                            )
+                            return
+                        }
+#endif
+                        continuation.resume(
+                            returning: FlowNodeSnapshot(
+                                cgImage: cgImage,
+                                scale: scale
+                            )
+                        )
+                    } else if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(
+                            throwing: LiveNodeSnapshotCaptureError.imageUnavailable
+                        )
+                    }
+                }
+            }
+            guard !Task.isCancelled else { return nil }
+            return flowSnapshot
+        } catch {
+            traceSnapshotFailure(nodeID: nodeID, error: error)
+            return nil
+        }
+    }
+
+    private static func traceSnapshotFailure(nodeID: String, error: Error) {
+        let failure = LiveNodeSnapshotFailure(
+            nodeID: nodeID,
+            stage: .nativeViewCapture,
+            underlyingError: error
+        )
+        print("[SwiftFlow][LiveNodePoster] event=captureFailed \(failure)")
+    }
+
     nonisolated func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
         Task { @MainActor [weak self, weak mapView] in
             guard let self, let mapView else { return }
@@ -273,6 +383,9 @@ final class LiveMapNodeCoordinator: NSObject, MKMapViewDelegate {
 struct LiveMapRepresentable: UIViewRepresentable {
 
     @Environment(\.isFlowNodeHovered) private var isHovered
+    @Environment(\.liveNodePosterContext) private var posterContext
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.liveNodeSnapshotDisplayScale) private var snapshotDisplayScale
 
     let nodeID: String
     let initialCoordinate: CLLocationCoordinate2D
@@ -300,6 +413,11 @@ struct LiveMapRepresentable: UIViewRepresentable {
         mapView.onWindowAttach = { [weak coordinator] view in
             coordinator?.kickIfReady(view)
         }
+        coordinator.bindPosterProvider(
+            mapView: mapView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
 
         return mapView
     }
@@ -307,6 +425,11 @@ struct LiveMapRepresentable: UIViewRepresentable {
     func updateUIView(_ mapView: MKMapView, context: Context) {
         let coordinator = context.coordinator
         mapView.layer.cornerRadius = cornerRadius
+        coordinator.bindPosterProvider(
+            mapView: mapView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
 
@@ -334,6 +457,9 @@ struct LiveMapRepresentable: UIViewRepresentable {
 struct LiveMapRepresentable: NSViewRepresentable {
 
     @Environment(\.isFlowNodeHovered) private var isHovered
+    @Environment(\.liveNodePosterContext) private var posterContext
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.liveNodeSnapshotDisplayScale) private var snapshotDisplayScale
 
     let nodeID: String
     let initialCoordinate: CLLocationCoordinate2D
@@ -362,6 +488,11 @@ struct LiveMapRepresentable: NSViewRepresentable {
         mapView.onWindowAttach = { [weak coordinator] view in
             coordinator?.kickIfReady(view)
         }
+        coordinator.bindPosterProvider(
+            mapView: mapView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
 
         return mapView
     }
@@ -369,6 +500,11 @@ struct LiveMapRepresentable: NSViewRepresentable {
     func updateNSView(_ mapView: MKMapView, context: Context) {
         let coordinator = context.coordinator
         mapView.layer?.cornerRadius = cornerRadius
+        coordinator.bindPosterProvider(
+            mapView: mapView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         coordinator.updateInteractionState(isHovered, mapView: mapView)
     }
 

@@ -170,10 +170,34 @@ private struct ResizeHandleOverlay<Data: Sendable & Hashable>: View {
 
 @MainActor
 private final class WebNodeCoordinator: NSObject, WKNavigationDelegate {
-    var posterContext: LiveNodePosterContext?
+    private var posterContext: LiveNodePosterContext?
 
     override init() {
         super.init()
+    }
+
+    func bind(
+        webView: WKWebView,
+        posterContext: LiveNodePosterContext?,
+        snapshotScale: CGFloat
+    ) {
+        self.posterContext?.unregisterPosterProvider()
+        self.posterContext = posterContext
+        guard let posterContext else { return }
+        let nodeID = posterContext.nodeID
+        posterContext.registerPosterProvider { [weak webView] in
+            guard let webView else { return nil }
+            return await Self.snapshot(
+                webView: webView,
+                nodeID: nodeID,
+                scale: snapshotScale
+            )
+        }
+    }
+
+    func tearDown() {
+        posterContext?.unregisterPosterProvider()
+        posterContext = nil
     }
 
     nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -190,6 +214,59 @@ private final class WebNodeCoordinator: NSObject, WKNavigationDelegate {
             }
             await self?.posterContext?.requestPosterUpdate()
         }
+    }
+
+    private static func snapshot(
+        webView: WKWebView,
+        nodeID: String,
+        scale: CGFloat
+    ) async -> FlowNodeSnapshot? {
+        let bounds = webView.bounds
+        guard bounds.width > 1, bounds.height > 1 else {
+            traceSnapshotFailure(
+                nodeID: nodeID,
+                error: LiveNodeSnapshotCaptureError.invalidLogicalSize(bounds.size)
+            )
+            return nil
+        }
+
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = bounds
+        configuration.snapshotWidth = NSNumber(
+            value: Double(max(1, (bounds.width * scale).rounded()))
+        )
+        configuration.afterScreenUpdates = true
+
+        do {
+            let image = try await webView.takeSnapshot(configuration: configuration)
+#if os(iOS)
+            guard let cgImage = image.cgImage else {
+                throw LiveNodeSnapshotCaptureError.imageUnavailable
+            }
+#elseif os(macOS)
+            var proposedRect = CGRect(origin: .zero, size: image.size)
+            guard let cgImage = image.cgImage(
+                forProposedRect: &proposedRect,
+                context: nil,
+                hints: nil
+            ) else {
+                throw LiveNodeSnapshotCaptureError.imageUnavailable
+            }
+#endif
+            return FlowNodeSnapshot(cgImage: cgImage, scale: scale)
+        } catch {
+            traceSnapshotFailure(nodeID: nodeID, error: error)
+            return nil
+        }
+    }
+
+    private static func traceSnapshotFailure(nodeID: String, error: Error) {
+        let failure = LiveNodeSnapshotFailure(
+            nodeID: nodeID,
+            stage: .nativeViewCapture,
+            underlyingError: error
+        )
+        print("[SwiftFlow][LiveNodePoster] event=captureFailed \(failure)")
     }
 }
 
@@ -228,6 +305,8 @@ private struct WebNodeRepresentable: UIViewRepresentable {
     let cornerRadius: CGFloat
 
     @Environment(\.liveNodePosterContext) private var posterContext
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.liveNodeSnapshotDisplayScale) private var snapshotDisplayScale
 
     func makeCoordinator() -> WebNodeCoordinator {
         WebNodeCoordinator()
@@ -235,7 +314,6 @@ private struct WebNodeRepresentable: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let coordinator = context.coordinator
-        coordinator.posterContext = posterContext
 
         let webView = LiveWebView()
         webView.navigationDelegate = coordinator
@@ -243,20 +321,29 @@ private struct WebNodeRepresentable: UIViewRepresentable {
         webView.layer.masksToBounds = true
         webView.scrollView.layer.cornerRadius = cornerRadius
         webView.scrollView.layer.masksToBounds = true
+        coordinator.bind(
+            webView: webView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         loadIfNeeded(webView)
 
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        context.coordinator.posterContext = posterContext
+        context.coordinator.bind(
+            webView: webView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         webView.layer.cornerRadius = cornerRadius
         webView.scrollView.layer.cornerRadius = cornerRadius
         loadIfNeeded(webView)
     }
 
     static func dismantleUIView(_ webView: WKWebView, coordinator: WebNodeCoordinator) {
-        coordinator.posterContext = nil
+        coordinator.tearDown()
         webView.navigationDelegate = nil
     }
 
@@ -271,6 +358,8 @@ private struct WebNodeRepresentable: NSViewRepresentable {
     let cornerRadius: CGFloat
 
     @Environment(\.liveNodePosterContext) private var posterContext
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.liveNodeSnapshotDisplayScale) private var snapshotDisplayScale
 
     func makeCoordinator() -> WebNodeCoordinator {
         WebNodeCoordinator()
@@ -278,7 +367,6 @@ private struct WebNodeRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let coordinator = context.coordinator
-        coordinator.posterContext = posterContext
 
         let webView = LiveWebView()
         webView.disableWindowOcclusionDetection()
@@ -286,19 +374,28 @@ private struct WebNodeRepresentable: NSViewRepresentable {
         webView.wantsLayer = true
         webView.layer?.cornerRadius = cornerRadius
         webView.layer?.masksToBounds = true
+        coordinator.bind(
+            webView: webView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         loadIfNeeded(webView)
 
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        context.coordinator.posterContext = posterContext
+        context.coordinator.bind(
+            webView: webView,
+            posterContext: posterContext,
+            snapshotScale: max(snapshotDisplayScale ?? displayScale, 1)
+        )
         webView.layer?.cornerRadius = cornerRadius
         loadIfNeeded(webView)
     }
 
     static func dismantleNSView(_ webView: WKWebView, coordinator: WebNodeCoordinator) {
-        coordinator.posterContext = nil
+        coordinator.tearDown()
         webView.navigationDelegate = nil
     }
 
@@ -311,8 +408,8 @@ private struct WebNodeRepresentable: NSViewRepresentable {
 
 // MARK: - Web node wrapper
 
-/// View that lets each mounted representable own its `WKWebView`. The live
-/// host and the isolated poster host must never share one native view instance.
+/// View that lets the mounted representable own its `WKWebView`. Poster
+/// capture calls `takeSnapshot` on that same mounted instance.
 private struct WebNodeView: View {
 
     let node: FlowNode<LivePreviewData>
@@ -455,6 +552,8 @@ private struct LiveFlowPreview: View {
                     .font(.headline)
                 Text("Hover a node to switch from snapshot to its live view. Timeline Live stays live through liveNodeInteraction.")
                 Text("Drag from the header strip — flowDragHandle(for:in:) routes the drag through FlowStore, so the WKWebView / MKMapView body keeps its own scroll/pan.")
+                    .foregroundStyle(.secondary)
+                Text("Scroll the web page or change the map region, stop hovering, then hover again to compare the poster boundary and confirm the native view identity remains stable.")
                     .foregroundStyle(.secondary)
                 Text("Initial selection demonstrates selectionDecoration and selectionAccessory. Select the orange node and drag a corner handle to resize.")
                     .foregroundStyle(.secondary)

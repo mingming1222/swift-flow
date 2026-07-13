@@ -432,6 +432,25 @@ struct FlowStoreTests {
         #expect(store.nodeSnapshots["n1"] == snapshot)
     }
 
+    @Test("Clearing snapshots rejects in-flight stale writes")
+    func clearingSnapshotsRejectsStaleWrites() {
+        let store = FlowStore<String>()
+        store.addNode(FlowNode(id: "n1", position: .zero, data: "A"))
+        let staleGeneration = store.currentSnapshotGeneration()
+        let snapshot = makeSnapshot()
+
+        store.clearAllNodeSnapshots()
+        store.setNodeSnapshot(snapshot, for: "n1", generation: staleGeneration)
+
+        #expect(store.nodeSnapshots["n1"] == nil)
+        store.setNodeSnapshot(
+            snapshot,
+            for: "n1",
+            generation: store.currentSnapshotGeneration()
+        )
+        #expect(store.nodeSnapshots["n1"] == snapshot)
+    }
+
     @Test("Load normalizes decoded transient UI state")
     func loadNormalizesDecodedTransientUIState() {
         let store = FlowStore<String>()

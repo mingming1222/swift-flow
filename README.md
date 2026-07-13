@@ -248,24 +248,26 @@ FlowCanvas(store: store) { node, ctx in
 }
 ```
 
-`LiveNode` captures posters from the mounted node subtree. It does not rebuild the content through `ImageRenderer`, and it does not capture the containing window. `LiveNode` sizes itself to `node.size`, so the caller does **not** need to apply a `.frame(...)` matching the node — just compose any handle padding, clipping, shadows, or overlays around it.
+`LiveNode` captures posters from the mounted node subtree and normalizes them to the current display scale. It never rebuilds `content` in a second SwiftUI tree. On macOS, the default provider captures the owning app window through ScreenCaptureKit and crops the mounted node's exact screen rect from that image; the full window is never stored in `FlowStore`. ScreenCaptureKit requires Screen Recording access. SwiftFlow checks that access before capture and treats denial as a typed capture failure, so it keeps the live overlay visible instead of storing the black image returned by an unauthorized capture. `LiveNode` sizes itself to `node.size`, so the caller does **not** need to apply a `.frame(...)` matching the node — just compose any handle padding, clipping, shadows, or overlays around it.
+
+Canvas and the live overlay have exclusive drawing ownership. A node without a poster is drawn only by the visible, non-hittable warmup overlay; an idle node with a poster is drawn only by Canvas; interaction and capture handoff are drawn only by the overlay. Capture failure keeps the overlay visible instead of revealing a missing or stale poster. A mounted-window crop is accepted only when its source pixels already meet the canonical physical display density; a zoomed-out crop is never upscaled into a future poster. If an older canonical poster exists, it is retained until a sufficiently detailed replacement is available. During live zoom, SwiftUI's effective rendering scale follows the final screen density while poster storage remains canonical to the physical display scale.
 
 `LiveNode` is a phase dispatcher — its only sizing decision is matching `node.size`. Visual treatment (corner radius, the handle-inset padding that keeps handles on the border from being clipped, background, overlays, etc.) is composed with ordinary SwiftUI modifiers around `LiveNode`. Handle drawing is likewise the caller's responsibility: use `FlowNodeHandles(node:context:)` for the library default look, or compose `FlowHandle` views directly for fully custom handles.
 
 ### Native Views (WKWebView / MKMapView / AVPlayerView)
 
-The standard poster path captures the mounted node bitmap and is independent of the view type. `WKWebView`, `MKMapView`, `AVPlayerView`, pure SwiftUI content, and mixed content all use the same default poster pipeline.
+The standard poster path captures the mounted window and works for ordinary SwiftUI/AppKit/UIKit composition when Screen Recording access is available. Native views with their own snapshot API should register a provider from the same mounted instance. In particular, `WKWebView.takeSnapshot`, `MKMapSnapshotter`, and media frame extractors avoid Screen Recording permission and preserve the native renderer's current state. The cached image is normalized to `node.size × displayScale` pixels so its raster density matches the surrounding Canvas symbol instead of introducing a separately oversampled island.
 
-`LiveNodePosterContext` exists for views that intentionally choose custom poster timing or a custom poster source. Use it when the default hover-end capture is not the desired semantic moment, such as a video poster that should update only after playback reaches a chosen frame. Do not use it to recreate the node in a separate render tree.
+`LiveNodePosterContext` exists for views that choose a native poster source or custom poster timing. The provider must read the already-mounted native instance; it must not recreate the node in a second SwiftUI tree.
 
 | Method on ``LiveNodePosterContext`` | Purpose |
 |---|---|
 | `write(_:)` | Push an explicitly chosen poster when immediate writes are allowed |
 | `registerPosterProvider(_:)` | Install an async provider that `LiveNode` can invoke during poster updates |
 | `unregisterPosterProvider()` | Clear the provider from teardown paths |
-| `requestPosterUpdate()` | Ask `LiveNode` to run the currently preferred provider |
+| `requestPosterUpdate()` | Ask `LiveNode` to run the currently preferred provider. An idle mounted view is not captured while hidden; register a custom provider for idle updates. |
 
-The default pattern is to own the native view normally and let `LiveNode` capture the mounted bitmap:
+Own the native view normally and register its native snapshot provider from the representable. The complete `WKWebView.takeSnapshot` implementation used by the integration preview is in `FlowCanvasLivePreview.swift`:
 
 ```swift
 private struct WebNode: View {
@@ -287,12 +289,23 @@ private struct WebRepresentable: UIViewRepresentable {
     let webView: WKWebView
     let url: URL
 
+    @Environment(\.liveNodePosterContext) private var posterContext
+
     func makeUIView(context: Context) -> WKWebView {
         if webView.url == nil { webView.load(URLRequest(url: url)) }
+        registerPosterProvider()
         return webView
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {}
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        registerPosterProvider()
+    }
+
+    private func registerPosterProvider() {
+        posterContext?.registerPosterProvider { @MainActor in
+            await WebPosterProvider.snapshot(of: webView)
+        }
+    }
 }
 ```
 

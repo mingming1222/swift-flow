@@ -9,6 +9,7 @@ public struct FlowCanvas<
 
     @Bindable var store: FlowStore<NodeData>
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.displayScale) private var displayScale
     @Environment(\.undoManager) private var undoManager
 
     private let nodeContentBuilder: (FlowNode<NodeData>, NodeRenderContext) -> NodeView
@@ -392,6 +393,10 @@ public struct FlowCanvas<
         }
         .onChange(of: undoManager) { _, newValue in
             store.undoManager = newValue
+        }
+        .onChange(of: displayScale) { oldScale, newScale in
+            guard oldScale != newScale else { return }
+            store.clearAllNodeSnapshots()
         }
         // Preference collection lives inside `LiveNodeOverlay`'s
         // hidden registrar pass — Canvas's `symbols:` block does not
@@ -805,37 +810,35 @@ public struct FlowCanvas<
         for index in store.nodeIndicesFrontToBack.reversed() {
             let node = store.nodes[index]
 
-            // Skip rasterized draw for nodes the overlay is currently
-            // drawing (live view visible at opacity 1). Gated on both
-            // `renderedInteractive` *and* live presence — a plain node that
-            // becomes interactive on hover has no live view to hand off
-            // to, so Canvas must keep drawing it. While the user is
-            // mid-pan / mid-zoom we suppress this skip entirely so the
-            // Canvas keeps drawing every node from its poster — the
-            // overlay's live row is unmounted in that window, and
-            // skipping here would briefly drop the node from the
-            // canvas.
-            if !isViewportInteracting,
-               liveNodeInteractionCoordinator.overlayIsDrawing(node.id) {
-                continue
-            }
-
-            let screenOrigin = viewport.canvasToScreen(node.position)
-
-            // Expand draw rect to include handle protrusion
-            let drawRect = CGRect(
-                x: screenOrigin.x - handleInset * viewport.zoom,
-                y: screenOrigin.y - handleInset * viewport.zoom,
-                width: (node.size.width + handleInset * 2) * viewport.zoom,
-                height: (node.size.height + handleInset * 2) * viewport.zoom
+            let geometry = LiveNodeScreenGeometry(
+                nodePosition: node.position,
+                nodeSize: node.size,
+                viewport: viewport,
+                handleInset: handleInset
             )
 
             // Viewport culling
             let visibleRect = CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin)
-            guard visibleRect.intersects(drawRect) else { continue }
+            guard visibleRect.intersects(geometry.drawRect) else { continue }
+
+            // Canvas and overlay resolve the same presentation state. This
+            // makes drawing ownership exclusive during warmup, interaction,
+            // capture handoff, failure, and viewport gestures.
+            let presentationState = LiveNodePresentationState(
+                isLiveNode: liveNodeInteractionCoordinator.liveNodeIDs.contains(node.id),
+                hasSnapshot: store.nodeSnapshots[node.id] != nil,
+                mountPolicy: liveNodeInteractionCoordinator.mountPolicy(for: node.id),
+                hasInteractionIntent: liveNodeInteractionPredicate(node, store),
+                keepsOverlayVisibleForHandoff: liveNodeInteractionCoordinator
+                    .isRenderedInteractive(node.id),
+                isViewportInteracting: isViewportInteracting
+            )
+            if presentationState.suppressesCanvas {
+                continue
+            }
 
             if let resolved = context.resolveSymbol(id: node.id) {
-                context.draw(resolved, in: drawRect)
+                context.draw(resolved, in: geometry.drawRect)
             }
         }
     }

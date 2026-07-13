@@ -3,24 +3,22 @@ import Foundation
 import SwiftUI
 
 @MainActor
-struct LiveNodeMountedViewSnapshotHost<SnapshotContent: View>: View {
+struct LiveNodeMountedViewSnapshotHost: View {
     let nodeID: String
     let size: CGSize
     let scale: CGFloat
+    let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
-    let swiftUIEnvironment: EnvironmentValues
     let snapshotProviderReady: () -> Void
-    let content: () -> SnapshotContent
 
     var body: some View {
         PlatformMountedViewSnapshotHost(
             nodeID: nodeID,
             size: size,
             scale: scale,
+            isSurfaceVisible: isSurfaceVisible,
             registry: registry,
-            swiftUIEnvironment: swiftUIEnvironment,
-            snapshotProviderReady: snapshotProviderReady,
-            content: content
+            snapshotProviderReady: snapshotProviderReady
         )
         .frame(width: size.width, height: size.height)
     }
@@ -28,20 +26,20 @@ struct LiveNodeMountedViewSnapshotHost<SnapshotContent: View>: View {
 
 #if os(macOS)
 import AppKit
-import ScreenCaptureKit
 
 @MainActor
-private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: NSViewRepresentable {
+private struct PlatformMountedViewSnapshotHost: NSViewRepresentable {
     let nodeID: String
     let size: CGSize
     let scale: CGFloat
+    let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
-    let swiftUIEnvironment: EnvironmentValues
     let snapshotProviderReady: () -> Void
-    let content: () -> SnapshotContent
 
     func makeNSView(context: Context) -> MountedViewSnapshotNSView {
-        MountedViewSnapshotNSView()
+        MountedViewSnapshotNSView(
+            capturer: ScreenCaptureKitLiveNodeWindowCapturer()
+        )
     }
 
     func updateNSView(_ nsView: MountedViewSnapshotNSView, context: Context) {
@@ -49,10 +47,9 @@ private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: NSViewRep
             nodeID: nodeID,
             size: size,
             scale: scale,
+            isSurfaceVisible: isSurfaceVisible,
             registry: registry,
-            swiftUIEnvironment: swiftUIEnvironment,
-            snapshotProviderReady: snapshotProviderReady,
-            content: content
+            snapshotProviderReady: snapshotProviderReady
         )
     }
 
@@ -64,10 +61,12 @@ private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: NSViewRep
 @MainActor
 private final class MountedViewSnapshotNSView: NSView {
     private let token = UUID()
+    private let capturer: any LiveNodeWindowCapturing
     private weak var registry: LiveNodeSnapshotRegistry?
     private var nodeID: String = ""
     private var snapshotSize: CGSize = .zero
-    private var snapshotScale: CGFloat = 2
+    private var snapshotScale: CGFloat = 1
+    private var isSurfaceVisible = false
     private var snapshotProviderReady: (() -> Void)?
     private var didNotifySnapshotProviderReady = false
 
@@ -76,35 +75,35 @@ private final class MountedViewSnapshotNSView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    init() {
+    init(capturer: any LiveNodeWindowCapturing) {
+        self.capturer = capturer
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
     }
 
-    func update<SnapshotContent: View>(
+    func update(
         nodeID: String,
         size: CGSize,
         scale: CGFloat,
+        isSurfaceVisible: Bool,
         registry: LiveNodeSnapshotRegistry,
-        swiftUIEnvironment: EnvironmentValues,
-        snapshotProviderReady: @escaping () -> Void,
-        content: @escaping () -> SnapshotContent
+        snapshotProviderReady: @escaping () -> Void
     ) {
         self.nodeID = nodeID
         snapshotSize = size
         snapshotScale = scale
+        self.isSurfaceVisible = isSurfaceVisible
         self.snapshotProviderReady = snapshotProviderReady
         self.registry = registry
         registry.setMountedViewSnapshotProvider(token: token) { [weak self] in
             guard let self else { return nil }
-            return await LiveNodeIsolatedSnapshotRenderer.render(
-                nodeID: self.nodeID,
-                size: self.snapshotSize,
-                scale: self.snapshotScale,
-                swiftUIEnvironment: swiftUIEnvironment,
-                content: content
-            )
+            do {
+                return try await self.snapshotMountedNode()
+            } catch {
+                self.traceFailure(error)
+                return nil
+            }
         }
         notifySnapshotProviderReadyIfPossible()
     }
@@ -125,6 +124,30 @@ private final class MountedViewSnapshotNSView: NSView {
         notifySnapshotProviderReadyIfPossible()
     }
 
+    private func snapshotMountedNode() async throws -> FlowNodeSnapshot {
+        guard isSurfaceVisible else {
+            throw LiveNodeSnapshotCaptureError.surfaceNotVisible
+        }
+        guard let window else {
+            throw LiveNodeSnapshotCaptureError.windowUnavailable
+        }
+        guard bounds.width > 1, bounds.height > 1 else {
+            throw LiveNodeSnapshotCaptureError.invalidLogicalSize(bounds.size)
+        }
+
+        window.contentView?.layoutSubtreeIfNeeded()
+        let windowRect = convert(bounds, to: nil)
+        let nodeScreenRect = window.convertToScreen(windowRect)
+        let windowScreenFrame = window.frame
+        return try await LiveNodeMountedWindowSnapshotter(capturer: capturer).snapshot(
+            windowID: CGWindowID(window.windowNumber),
+            nodeScreenRect: nodeScreenRect,
+            windowScreenFrame: windowScreenFrame,
+            logicalSize: snapshotSize,
+            scale: snapshotScale
+        )
+    }
+
     private func notifySnapshotProviderReadyIfPossible() {
         guard window != nil else { return }
         guard bounds.width > 1, bounds.height > 1 else { return }
@@ -135,230 +158,13 @@ private final class MountedViewSnapshotNSView: NSView {
         }
     }
 
-}
-
-@MainActor
-private enum LiveNodeIsolatedSnapshotRenderer {
-
-    enum CaptureError: Error {
-        case windowUnavailable
-        case shareableWindowUnavailable
-        case imageUnavailable
-    }
-
-    static func render<SnapshotContent: View>(
-        nodeID: String,
-        size: CGSize,
-        scale: CGFloat,
-        swiftUIEnvironment: EnvironmentValues,
-        content: @escaping () -> SnapshotContent
-    ) async -> FlowNodeSnapshot? {
-        guard size.width > 1, size.height > 1 else {
-            print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender skipped=invalidSize size=\(size)")
-            return nil
-        }
-
-        let layout = captureLayout(size: size, targetScale: scale)
-
-        print(
-            "[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender start "
-                + "size=\(size) scale=\(layout.targetScale) backingScale=\(layout.backingScale) "
-                + "renderScale=\(layout.renderScale)"
-        )
-
-        let hostingView = NSHostingView(
-            rootView: content()
-                .frame(width: size.width, height: size.height)
-                .environment(\.self, swiftUIEnvironment)
-                .environment(\.displayScale, layout.targetScale)
-                .environment(\.liveNodePosterContext, nil)
-                .environment(\.defersLiveNodeSnapshotWrites, true)
-                .scaleEffect(layout.renderScale, anchor: .topLeading)
-                .frame(
-                    width: layout.renderSize.width,
-                    height: layout.renderSize.height,
-                    alignment: .topLeading
-                )
-        )
-        hostingView.frame = CGRect(origin: .zero, size: layout.renderSize)
-        hostingView.wantsLayer = true
-
-        let window = NSWindow(
-            contentRect: layout.windowFrame,
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender windowFrame=\(window.frame)")
-        window.contentView = hostingView
-        window.isReleasedWhenClosed = false
-        window.backgroundColor = .clear
-        window.isOpaque = false
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
-        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .stationary]
-        window.orderFrontRegardless()
-        defer {
-            window.orderOut(nil)
-            window.contentView = nil
-        }
-
-        for _ in 0..<20 {
-            await Task.yield()
-            guard await waitForFrame() else { return nil }
-            hostingView.layoutSubtreeIfNeeded()
-            hostingView.displayIfNeeded()
-        }
-
-        do {
-            let snapshot = try await captureWindow(window, nodeID: nodeID, size: size, scale: layout.targetScale)
-            print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender captured")
-            return snapshot
-        } catch {
-            print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=mountedRender failed error=\(error)")
-            return nil
-        }
-    }
-
-    private struct CaptureLayout {
-        let targetScale: CGFloat
-        let backingScale: CGFloat
-        let renderScale: CGFloat
-        let renderSize: CGSize
-        let windowFrame: CGRect
-    }
-
-    private static func captureLayout(size: CGSize, targetScale: CGFloat) -> CaptureLayout {
-        let screen = NSScreen.main ?? NSScreen.screens.first
-        let backingScale = max(1, screen?.backingScaleFactor ?? 1)
-        let targetScale = max(1, targetScale)
-        let renderScale = max(1, targetScale / backingScale)
-        let renderSize = CGSize(
-            width: max(1, (size.width * renderScale).rounded(.up)),
-            height: max(1, (size.height * renderScale).rounded(.up))
-        )
-
-        return CaptureLayout(
-            targetScale: targetScale,
-            backingScale: backingScale,
-            renderScale: renderScale,
-            renderSize: renderSize,
-            windowFrame: captureFrame(size: renderSize, screen: screen)
-        )
-    }
-
-    private static func captureFrame(size: CGSize, screen: NSScreen?) -> CGRect {
-        let screenFrame = screen?.frame ?? CGRect(origin: .zero, size: size)
-        let width = max(1, size.width.rounded(.up))
-        let height = max(1, size.height.rounded(.up))
-        let originX = screenFrame.minX + max(0, (screenFrame.width - width) / 2)
-        let originY = screenFrame.minY + max(0, (screenFrame.height - height) / 2)
-        return CGRect(
-            x: originX,
-            y: originY,
-            width: width,
-            height: height
-        )
-    }
-
-    private static func captureWindow(
-        _ window: NSWindow,
-        nodeID: String,
-        size: CGSize,
-        scale: CGFloat
-    ) async throws -> FlowNodeSnapshot {
-        let cgImage = try await captureImage(
+    private func traceFailure(_ error: Error) {
+        let failure = LiveNodeSnapshotFailure(
             nodeID: nodeID,
-            windowID: CGWindowID(window.windowNumber),
-            size: size,
-            scale: scale
+            stage: .mountedWindowCapture,
+            underlyingError: error
         )
-        let imageScale = CGFloat(cgImage.width) / max(1, size.width)
-        guard imageScale.isFinite, imageScale > 0 else {
-            throw CaptureError.imageUnavailable
-        }
-        return FlowNodeSnapshot(cgImage: cgImage, scale: imageScale)
-    }
-
-    private static func captureImage(
-        nodeID: String,
-        windowID: CGWindowID,
-        size: CGSize,
-        scale: CGFloat
-    ) async throws -> CGImage {
-        print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=screenCapture start windowID=\(windowID) size=\(size)")
-        let scWindow = try await shareableWindow(for: windowID, nodeID: nodeID)
-        print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=screenCapture filter windowID=\(scWindow.windowID) frame=\(scWindow.frame)")
-        let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-        let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int((size.width * scale).rounded(.toNearestOrAwayFromZero)))
-        configuration.height = max(1, Int((size.height * scale).rounded(.toNearestOrAwayFromZero)))
-        configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.scalesToFit = true
-        configuration.preservesAspectRatio = false
-        configuration.showsCursor = false
-
-        return try await withCheckedThrowingContinuation { continuation in
-            SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            ) { image, error in
-                if let image {
-                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=screenCapture success pixels=\(image.width)x\(image.height)")
-                    continuation.resume(returning: image)
-                    return
-                }
-                if let error {
-                    print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=screenCapture failed error=\(error)")
-                    continuation.resume(throwing: error)
-                    return
-                }
-                print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=screenCapture failed error=imageUnavailable")
-                continuation.resume(throwing: CaptureError.imageUnavailable)
-            }
-        }
-    }
-
-    private static func shareableWindow(for windowID: CGWindowID, nodeID: String) async throws -> SCWindow {
-        for attempt in 0..<10 {
-            let content = try await shareableContent()
-            if let window = content.windows.first(where: { $0.windowID == windowID }) {
-                print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=shareableWindow found attempt=\(attempt) frame=\(window.frame)")
-                return window
-            }
-            print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=shareableWindow missing attempt=\(attempt) windowCount=\(content.windows.count)")
-            guard await waitForFrame() else {
-                throw CaptureError.windowUnavailable
-            }
-        }
-        print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=shareableWindow unavailable windowID=\(windowID)")
-        throw CaptureError.shareableWindowUnavailable
-    }
-
-    private static func shareableContent() async throws -> SCShareableContent {
-        do {
-            let content = try await SCShareableContent.currentProcess
-            if !content.windows.isEmpty {
-                return content
-            }
-        } catch {
-            // Fall through to the explicit offscreen-capable query below.
-        }
-
-        return try await SCShareableContent.excludingDesktopWindows(
-            false,
-            onScreenWindowsOnly: false
-        )
-    }
-
-    private static func waitForFrame() async -> Bool {
-        do {
-            try await Task.sleep(nanoseconds: 16_000_000)
-            return true
-        } catch {
-            return false
-        }
+        print("[SwiftFlow][LiveNodePoster] event=captureFailed \(failure)")
     }
 }
 
@@ -366,14 +172,13 @@ private enum LiveNodeIsolatedSnapshotRenderer {
 import UIKit
 
 @MainActor
-private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: UIViewRepresentable {
+private struct PlatformMountedViewSnapshotHost: UIViewRepresentable {
     let nodeID: String
     let size: CGSize
     let scale: CGFloat
+    let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
-    let swiftUIEnvironment: EnvironmentValues
     let snapshotProviderReady: () -> Void
-    let content: () -> SnapshotContent
 
     func makeUIView(context: Context) -> MountedViewSnapshotUIView {
         MountedViewSnapshotUIView()
@@ -381,7 +186,10 @@ private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: UIViewRep
 
     func updateUIView(_ uiView: MountedViewSnapshotUIView, context: Context) {
         uiView.update(
+            nodeID: nodeID,
+            size: size,
             scale: scale,
+            isSurfaceVisible: isSurfaceVisible,
             registry: registry,
             snapshotProviderReady: snapshotProviderReady
         )
@@ -396,7 +204,10 @@ private struct PlatformMountedViewSnapshotHost<SnapshotContent: View>: UIViewRep
 private final class MountedViewSnapshotUIView: UIView {
     private let token = UUID()
     private weak var registry: LiveNodeSnapshotRegistry?
-    private var snapshotScale: CGFloat = 2
+    private var nodeID: String = ""
+    private var snapshotSize: CGSize = .zero
+    private var snapshotScale: CGFloat = 1
+    private var isSurfaceVisible = false
     private var snapshotProviderReady: (() -> Void)?
     private var didNotifySnapshotProviderReady = false
 
@@ -412,15 +223,27 @@ private final class MountedViewSnapshotUIView: UIView {
     }
 
     func update(
+        nodeID: String,
+        size: CGSize,
         scale: CGFloat,
+        isSurfaceVisible: Bool,
         registry: LiveNodeSnapshotRegistry,
         snapshotProviderReady: @escaping () -> Void
     ) {
+        self.nodeID = nodeID
+        snapshotSize = size
         snapshotScale = scale
+        self.isSurfaceVisible = isSurfaceVisible
         self.snapshotProviderReady = snapshotProviderReady
         self.registry = registry
         registry.setMountedViewSnapshotProvider(token: token) { [weak self] in
-            self?.snapshotMountedNode()
+            guard let self else { return nil }
+            do {
+                return try self.snapshotMountedNode()
+            } catch {
+                self.traceFailure(error)
+                return nil
+            }
         }
         notifySnapshotProviderReadyIfPossible()
     }
@@ -441,36 +264,42 @@ private final class MountedViewSnapshotUIView: UIView {
         notifySnapshotProviderReadyIfPossible()
     }
 
-    private func notifySnapshotProviderReadyIfPossible() {
-        guard window != nil else { return }
-        guard bounds.width > 1, bounds.height > 1 else { return }
-        guard !didNotifySnapshotProviderReady else { return }
-        didNotifySnapshotProviderReady = true
-        Task { @MainActor [weak self] in
-            self?.snapshotProviderReady?()
+    private func snapshotMountedNode() throws -> FlowNodeSnapshot {
+        guard isSurfaceVisible else {
+            throw LiveNodeSnapshotCaptureError.surfaceNotVisible
         }
-    }
-
-    private func snapshotMountedNode() -> FlowNodeSnapshot? {
-        guard let targetView = snapshotTargetView() else { return nil }
+        guard let targetView = snapshotTargetView() else {
+            throw LiveNodeSnapshotCaptureError.windowUnavailable
+        }
         let captureBounds = convert(bounds, to: targetView)
-        guard captureBounds.width > 1, captureBounds.height > 1 else { return nil }
+        guard captureBounds.width > 1, captureBounds.height > 1 else {
+            throw LiveNodeSnapshotCaptureError.invalidLogicalSize(captureBounds.size)
+        }
 
         targetView.layoutIfNeeded()
-
         let format = UIGraphicsImageRendererFormat()
         format.scale = snapshotScale
         format.opaque = targetView.isOpaque
 
+        var didDraw = false
         let renderer = UIGraphicsImageRenderer(size: captureBounds.size, format: format)
         let image = renderer.image { context in
             context.cgContext.translateBy(x: -captureBounds.minX, y: -captureBounds.minY)
-            targetView.drawHierarchy(in: targetView.bounds, afterScreenUpdates: true)
+            didDraw = targetView.drawHierarchy(
+                in: targetView.bounds,
+                afterScreenUpdates: true
+            )
         }
-        guard let cgImage = image.cgImage else {
-            return nil
+        guard didDraw, let cgImage = image.cgImage else {
+            throw LiveNodeSnapshotCaptureError.renderingFailed
         }
-        return FlowNodeSnapshot(cgImage: cgImage, scale: image.scale)
+        let snapshot = FlowNodeSnapshot(cgImage: cgImage, scale: snapshotScale)
+        try LiveNodeSnapshotQuality.validate(
+            snapshot,
+            logicalSize: snapshotSize,
+            requiredScale: snapshotScale
+        )
+        return snapshot
     }
 
     private func snapshotTargetView() -> UIView? {
@@ -488,7 +317,11 @@ private final class MountedViewSnapshotUIView: UIView {
 
             if isNodeSizedTarget(view, captureBounds: captureBounds) {
                 sizedFallback = sizedFallback ?? view
-                if hasVisibleContentSibling(in: view, excluding: child, captureBounds: captureBounds) {
+                if hasVisibleContentSibling(
+                    in: view,
+                    excluding: child,
+                    captureBounds: captureBounds
+                ) {
                     return view
                 }
             }
@@ -524,6 +357,24 @@ private final class MountedViewSnapshotUIView: UIView {
                 && sibling.frame.intersects(captureBounds)
         }
     }
-}
 
+    private func notifySnapshotProviderReadyIfPossible() {
+        guard window != nil else { return }
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        guard !didNotifySnapshotProviderReady else { return }
+        didNotifySnapshotProviderReady = true
+        Task { @MainActor [weak self] in
+            self?.snapshotProviderReady?()
+        }
+    }
+
+    private func traceFailure(_ error: Error) {
+        let failure = LiveNodeSnapshotFailure(
+            nodeID: nodeID,
+            stage: .mountedViewCapture,
+            underlyingError: error
+        )
+        print("[SwiftFlow][LiveNodePoster] event=captureFailed \(failure)")
+    }
+}
 #endif
