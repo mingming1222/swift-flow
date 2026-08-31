@@ -21,6 +21,7 @@ public struct FlowCanvas<
     private var accessoryAnimation: Animation? = .easeOut(duration: 0.16)
     private var selectionDecorationDrawers: [SelectionDecorationDrawer<NodeData>] = []
     private var selectionAccessoryBuilders: [SelectionAccessoryBuilder<NodeData>] = []
+    private var liveNodeSupport: LiveNodeSupport = .enabled
     private var liveNodeInteractionPredicate: (FlowNode<NodeData>, FlowStore<NodeData>) -> Bool = { node, store in
         store.hoveredNodeID == node.id
     }
@@ -181,6 +182,18 @@ public struct FlowCanvas<
     }
 
     // MARK: - Live Node Interaction
+
+    /// Configures whether this canvas can contain ``LiveNode`` content.
+    ///
+    /// Live-node support is enabled by default for source compatibility. When
+    /// disabled, the canvas omits the live overlay and its all-node registrar
+    /// pass. Use `.disabled` when the node builder is known to contain only
+    /// regular SwiftUI content rendered through Canvas symbols.
+    public func liveNodeSupport(_ support: LiveNodeSupport) -> FlowCanvas {
+        var copy = self
+        copy.liveNodeSupport = support
+        return copy
+    }
 
     /// Overrides the predicate that decides which nodes are interactive in
     /// the live overlay layer.
@@ -453,15 +466,17 @@ public struct FlowCanvas<
                 builders: selectionAccessoryBuilders
             )
             hostView
-            LiveNodeOverlay(
-                store: store,
-                canvasSize: size,
-                nodeContent: nodeContentBuilder,
-                renderContext: { node in nodeRenderContext(for: node) },
-                interaction: liveNodeInteractionPredicate,
-                coordinator: liveNodeInteractionCoordinator,
-                isViewportInteracting: isViewportInteracting
-            )
+            if isLiveNodeOverlayEnabled {
+                LiveNodeOverlay(
+                    store: store,
+                    canvasSize: size,
+                    nodeContent: nodeContentBuilder,
+                    renderContext: { node in nodeRenderContext(for: node) },
+                    interaction: liveNodeInteractionPredicate,
+                    coordinator: liveNodeInteractionCoordinator,
+                    isViewportInteracting: isViewportInteracting
+                )
+            }
             if hasAccessory {
                 AccessoryOverlay(
                     store: store,
@@ -537,15 +552,17 @@ public struct FlowCanvas<
                 builders: selectionAccessoryBuilders
             )
             hostView
-            LiveNodeOverlay(
-                store: store,
-                canvasSize: size,
-                nodeContent: nodeContentBuilder,
-                renderContext: { node in nodeRenderContext(for: node) },
-                interaction: liveNodeInteractionPredicate,
-                coordinator: liveNodeInteractionCoordinator,
-                isViewportInteracting: isViewportInteracting
-            )
+            if isLiveNodeOverlayEnabled {
+                LiveNodeOverlay(
+                    store: store,
+                    canvasSize: size,
+                    nodeContent: nodeContentBuilder,
+                    renderContext: { node in nodeRenderContext(for: node) },
+                    interaction: liveNodeInteractionPredicate,
+                    coordinator: liveNodeInteractionCoordinator,
+                    isViewportInteracting: isViewportInteracting
+                )
+            }
             if hasAccessory {
                 AccessoryOverlay(
                     store: store,
@@ -821,26 +838,32 @@ public struct FlowCanvas<
             let visibleRect = CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin)
             guard visibleRect.intersects(geometry.drawRect) else { continue }
 
-            // Canvas and overlay resolve the same presentation state. This
-            // makes drawing ownership exclusive during warmup, interaction,
-            // capture handoff, failure, and viewport gestures.
-            let presentationState = LiveNodePresentationState(
-                isLiveNode: liveNodeInteractionCoordinator.liveNodeIDs.contains(node.id),
-                hasSnapshot: store.nodeSnapshots[node.id] != nil,
-                mountPolicy: liveNodeInteractionCoordinator.mountPolicy(for: node.id),
-                hasInteractionIntent: liveNodeInteractionPredicate(node, store),
-                keepsOverlayVisibleForHandoff: liveNodeInteractionCoordinator
-                    .isRenderedInteractive(node.id),
-                isViewportInteracting: isViewportInteracting
-            )
-            if presentationState.suppressesCanvas {
-                continue
+            if isLiveNodeOverlayEnabled {
+                // Canvas and overlay resolve the same presentation state. This
+                // makes drawing ownership exclusive during warmup, interaction,
+                // capture handoff, failure, and viewport gestures.
+                let presentationState = LiveNodePresentationState(
+                    isLiveNode: liveNodeInteractionCoordinator.liveNodeIDs.contains(node.id),
+                    hasSnapshot: store.nodeSnapshots[node.id] != nil,
+                    mountPolicy: liveNodeInteractionCoordinator.mountPolicy(for: node.id),
+                    hasInteractionIntent: liveNodeInteractionPredicate(node, store),
+                    keepsOverlayVisibleForHandoff: liveNodeInteractionCoordinator
+                        .isRenderedInteractive(node.id),
+                    isViewportInteracting: isViewportInteracting
+                )
+                if presentationState.suppressesCanvas {
+                    continue
+                }
             }
 
             if let resolved = context.resolveSymbol(id: node.id) {
                 context.draw(resolved, in: geometry.drawRect)
             }
         }
+    }
+
+    var isLiveNodeOverlayEnabled: Bool {
+        liveNodeSupport == .enabled
     }
 
     // MARK: - Drawing: Selection Rect
