@@ -1178,7 +1178,12 @@ public struct FlowCanvas<
         store.setHoveredNode(nodeID, source: source)
     }
 
-    private func cursor(at location: CGPoint) -> NSCursor {
+    // Both CanvasHostView and CanvasHoverTrackingView resolve cursors here.
+    // Filtering only the hover tracker lets the host overwrite control cursors.
+    func cursor(at location: CGPoint) -> NSCursor {
+        guard !hoverExclusionRegions.contains(where: { $0.contains(location) }) else {
+            return .arrow
+        }
         switch dragMode {
         case .nodeMove:
             return .closedHand

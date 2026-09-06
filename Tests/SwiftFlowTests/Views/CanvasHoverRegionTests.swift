@@ -16,6 +16,28 @@ struct CanvasHoverRegionTests {
     }
 
     #if os(macOS)
+    @Test("The host cursor resolver respects controls above nodes, including a transformed viewport")
+    func hostCursorRespectsExclusions() {
+        _ = NSApplication.shared
+        let store = FlowStore<String>()
+        store.addNode(FlowNode(id: "node", position: .zero, size: CGSize(width: 240, height: 160), data: "Node"))
+        store.zoom(by: 1.5, anchor: .zero)
+        store.pan(by: CGSize(width: 45, height: 30))
+        let point = store.viewport.canvasToScreen(CGPoint(x: 120, y: 80))
+        let control = CanvasHoverRegion(
+            frame: CGRect(x: point.x - 18, y: point.y - 18, width: 36, height: 36),
+            cornerRadius: 18
+        )
+        let canvas = FlowCanvas(store: store)
+        #expect(canvas.cursor(at: point) === NSCursor.openHand)
+        let coveredCanvas = canvas.hoverExclusionRegions([control])
+        #expect(coveredCanvas.cursor(at: point) === NSCursor.arrow)
+        // The transparent circle corner still belongs to the underlying node.
+        let corner = CGPoint(x: control.frame.minX + 1, y: control.frame.minY + 1)
+        #expect(coveredCanvas.cursor(at: corner) === NSCursor.openHand)
+        #expect(coveredCanvas.hoverExclusionRegions([]).cursor(at: point) === NSCursor.openHand)
+    }
+
     @Test("Entering a control clears node hover without asking for a node cursor; leaving restores it")
     func clearsAndRestoresHover() {
         let view = CanvasHoverTrackingNSView()
