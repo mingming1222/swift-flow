@@ -25,9 +25,18 @@ public struct FlowCanvas<
     private var liveNodeInteractionPredicate: (FlowNode<NodeData>, FlowStore<NodeData>) -> Bool = { node, store in
         store.hoveredNodeID == node.id
     }
+    private var hoverExclusionRegions: [CanvasHoverRegion] = []
     private var deleteActionHandler: ((FlowStore<NodeData>) -> Bool)?
     private var registeredDropTypes: [String] = []
     private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
+
+    /// Excludes editor controls from node hover and node cursor resolution.
+    /// Pass actual visible control regions in canvas screen coordinates.
+    public func hoverExclusionRegions(_ regions: [CanvasHoverRegion]) -> Self {
+        var copy = self
+        copy.hoverExclusionRegions = regions
+        return copy
+    }
 
     // MARK: - Init: Default
 
@@ -495,6 +504,7 @@ public struct FlowCanvas<
                 builders: selectionAccessoryBuilders
             )
             CanvasHoverTrackingView(
+                exclusionRegions: hoverExclusionRegions,
                 onHover: { location in
                     updateHover(at: location, source: "canvas.hoverTracking")
                 },
@@ -535,7 +545,8 @@ public struct FlowCanvas<
             switch phase {
             case .active(let location):
                 let canvasPoint = store.viewport.screenToCanvas(location)
-                let nodeID = store.hitTestNode(at: canvasPoint)
+                let nodeID = hoverExclusionRegions.contains(where: { $0.contains(location) })
+                    ? nil : store.hitTestNode(at: canvasPoint)
                 store.setHoveredNode(nodeID, source: "canvas.hover.active")
             case .ended:
                 store.setHoveredNode(nil, source: "canvas.hover.ended")
@@ -1158,6 +1169,10 @@ public struct FlowCanvas<
     }
 
     private func updateHover(at location: CGPoint, source: String) {
+        guard !hoverExclusionRegions.contains(where: { $0.contains(location) }) else {
+            store.setHoveredNode(nil, source: source)
+            return
+        }
         let canvasPoint = store.viewport.screenToCanvas(location)
         let nodeID = store.hitTestNode(at: canvasPoint)
         store.setHoveredNode(nodeID, source: source)

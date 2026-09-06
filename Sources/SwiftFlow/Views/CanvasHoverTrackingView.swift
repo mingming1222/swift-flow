@@ -4,6 +4,7 @@ import SwiftUI
 
 struct CanvasHoverTrackingView: NSViewRepresentable {
 
+    let exclusionRegions: [CanvasHoverRegion]
     let onHover: @MainActor (CGPoint) -> Void
     let onExit: @MainActor () -> Void
     let cursorAt: @MainActor (CGPoint) -> NSCursor
@@ -12,6 +13,7 @@ struct CanvasHoverTrackingView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> CanvasHoverTrackingNSView {
         let view = CanvasHoverTrackingNSView()
+        view.exclusionRegions = exclusionRegions
         view.onHover = onHover
         view.onExit = onExit
         view.cursorAt = cursorAt
@@ -26,11 +28,22 @@ struct CanvasHoverTrackingView: NSViewRepresentable {
         nsView.cursorAt = cursorAt
         nsView.onMagnify = onMagnify
         nsView.shouldHandleViewportMagnify = shouldHandleViewportMagnify
+        if nsView.exclusionRegions != exclusionRegions {
+            nsView.exclusionRegions = exclusionRegions
+            // Geometry updates can cover a stationary pointer. Reconcile after
+            // SwiftUI finishes updating the native view, avoiding state writes
+            // during view evaluation.
+            DispatchQueue.main.async { [weak nsView] in
+                nsView?.refreshHoverAtCurrentLocation()
+            }
+        }
     }
 }
 
 final class CanvasHoverTrackingNSView: NSView {
 
+    var exclusionRegions: [CanvasHoverRegion] = []
+    private var isHoverExcluded = false
     var onHover: (@MainActor (CGPoint) -> Void)?
     var onExit: (@MainActor () -> Void)?
     var cursorAt: (@MainActor (CGPoint) -> NSCursor)?
@@ -137,11 +150,28 @@ final class CanvasHoverTrackingNSView: NSView {
     }
 
     private func updateHoverAndCursor(for event: NSEvent) {
-        let location = flippedLocation(from: event)
-        MainActor.assumeIsolated {
-            onHover?(location)
-            (cursorAt?(location) ?? .arrow).set()
+        updateHoverAndCursor(at: flippedLocation(from: event))
+    }
+
+    @MainActor
+    func updateHoverAndCursor(at location: CGPoint) {
+        if exclusionRegions.contains(where: { $0.contains(location) }) {
+            onExit?()
+            if !isHoverExcluded { NSCursor.arrow.set() }
+            isHoverExcluded = true
+            return
         }
+        isHoverExcluded = false
+        onHover?(location)
+        (cursorAt?(location) ?? .arrow).set()
+    }
+
+    @MainActor
+    func refreshHoverAtCurrentLocation() {
+        guard let window, window.isKeyWindow else { return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(point) else { return }
+        updateHoverAndCursor(at: CGPoint(x: point.x, y: bounds.height - point.y))
     }
 
     private func flippedLocation(from event: NSEvent) -> CGPoint {
