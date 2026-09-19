@@ -29,6 +29,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
 
     // Derived geometry must not invalidate SwiftUI while a Canvas resolves symbols.
     @ObservationIgnored var edgeGeometryCache = EdgeGeometryCache()
+    @ObservationIgnored private var nodeCompositePlanCache = NodeCompositePlanCache()
 
     // MARK: - Lookup Tables
 
@@ -99,6 +100,22 @@ public final class FlowStore<Data: Sendable & Hashable> {
         self.configuration = configuration
         rebuildNodeLookup()
         rebuildConnectionLookup()
+    }
+
+    /// Viewport changes do not rebuild subtree ownership or painter-order checks.
+    func compositeNodePlan(roots: Set<String>) -> NodeCompositePlan {
+        guard !roots.isEmpty else {
+            return NodeCompositePlan(nodes: nodes, backToFront: [], roots: [], inset: 0)
+        }
+        let inputs = nodes.map { NodeCompositePlanCache.Input(
+            id: $0.id, parentID: $0.parentID, frame: $0.frame, zIndex: $0.zIndex
+        ) }
+        if nodeCompositePlanCache.inputs == inputs, nodeCompositePlanCache.roots == roots,
+           let plan = nodeCompositePlanCache.plan { return plan }
+        let plan = NodeCompositePlan(nodes: nodes, backToFront: Array(nodeIndicesFrontToBack.reversed()),
+                                     roots: roots, inset: FlowHandle.diameter / 2)
+        nodeCompositePlanCache = NodeCompositePlanCache(inputs: inputs, roots: roots, plan: plan)
+        return plan
     }
 
     // MARK: - Hierarchy
@@ -2032,6 +2049,7 @@ extension FlowStore where Data: Codable {
         snapshotGeneration += 1
         nodeSnapshots.removeAll()
         edgeGeometryCache.removeAll()
+        nodeCompositePlanCache = NodeCompositePlanCache()
         nodeDragSession = nil
         pendingNodeChanges.removeAll()
         isInteractiveUpdateActive = false

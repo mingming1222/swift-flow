@@ -26,6 +26,17 @@ public struct FlowCanvas<
         store.hoveredNodeID == node.id
     }
     private var hoverExclusionRegions: [CanvasHoverRegion] = []
+    private var compositedRoots: Set<String> = []
+
+    /// Combines each requested subtree into one Canvas symbol while keeping
+    /// every node available for hit testing, accessibility and document updates.
+    /// Live-node mode and unsafe painter-order overlaps retain separate symbols.
+    public func compositedNodeRoots(_ roots: Set<String>) -> Self {
+        var copy = self
+        copy.compositedRoots = roots
+        return copy
+    }
+
     private var deleteActionHandler: ((FlowStore<NodeData>) -> Bool)?
     private var registeredDropTypes: [String] = []
     private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
@@ -342,6 +353,7 @@ public struct FlowCanvas<
 
     @ViewBuilder
     private func canvasBody(in size: CGSize) -> some View {
+        let compositePlan = store.compositeNodePlan(roots: isLiveNodeOverlayEnabled ? [] : compositedRoots)
         let canvasView = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) { context, canvasSize in
             let selectionContext = SelectionContextResolver.resolve(
                 store: store,
@@ -355,27 +367,27 @@ public struct FlowCanvas<
                 drawEdgesViaGraphicsContext(context: &context, canvasSize: canvasSize)
             }
             drawConnectionDraft(context: &context, canvasSize: canvasSize)
-            drawNodes(context: &context, canvasSize: canvasSize)
+            drawNodes(context: &context, canvasSize: canvasSize, compositePlan: compositePlan)
             drawSelectionDecorations(layer: .overlay, context: &context, selection: selectionContext)
             drawSelectionRect(context: &context)
         } symbols: {
-            ForEach(store.nodes) { node in
-                let context = nodeRenderContext(for: node)
-                nodeContentBuilder(node, context)
-                    .environment(\.flowNodeRenderPhase, .rasterize)
-                    .environment(\.flowNodeID, node.id)
-                    .environment(\.isFlowNodeSelected, store.selectedNodeIDs.contains(node.id))
-                    .environment(\.isFlowNodeHovered, store.hoveredNodeID == node.id)
-                    .environment(\.isFlowNodeFocused, store.focusedTarget == .node(node.id))
-                    .environment(
-                        \.liveNodeEnvironment,
-                        LiveNodeEnvironment(
-                            id: node.id,
-                            size: node.size,
-                            snapshot: context.snapshot
-                        )
-                    )
-                    .tag(node.id)
+            ForEach(store.nodes.filter { !compositePlan.memberIDs.contains($0.id) }) { node in
+                nodeSymbolContent(node).tag(node.id)
+            }
+            ForEach(compositePlan.batches) { batch in
+                ZStack(alignment: .topLeading) {
+                    ForEach(batch.members, id: \.self) { nodeID in
+                        if let node = store.nodeLookup[nodeID] {
+                            let inset = FlowHandle.diameter / 2
+                            nodeSymbolContent(node)
+                                .frame(width: node.size.width + inset * 2, height: node.size.height + inset * 2)
+                                .position(x: node.frame.midX - batch.bounds.minX,
+                                          y: node.frame.midY - batch.bounds.minY)
+                        }
+                    }
+                }
+                .frame(width: batch.bounds.width, height: batch.bounds.height)
+                .tag(CompositeNodeSymbolID(rootID: batch.id))
             }
             if let edgeContentBuilder {
                 ForEach(store.edges) { edge in
@@ -826,7 +838,7 @@ public struct FlowCanvas<
 
     // MARK: - Drawing: Nodes
 
-    private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize) {
+    private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize, compositePlan: NodeCompositePlan) {
         let viewport = store.viewport
         let margin: CGFloat = 100
 
@@ -837,6 +849,16 @@ public struct FlowCanvas<
         // Iterate back-to-front (reverse of front-to-back cache) for correct draw order
         for index in store.nodeIndicesFrontToBack.reversed() {
             let node = store.nodes[index]
+            if let batch = compositePlan.batchAtNodeID[node.id] {
+                let bounds = batch.bounds
+                let rect = CGRect(origin: viewport.canvasToScreen(bounds.origin),
+                                  size: CGSize(width: bounds.width * viewport.zoom, height: bounds.height * viewport.zoom))
+                if CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin).intersects(rect),
+                   let symbol = context.resolveSymbol(id: CompositeNodeSymbolID(rootID: batch.id)) {
+                    context.draw(symbol, in: rect)
+                }
+            }
+            if compositePlan.memberIDs.contains(node.id) { continue }
 
             let geometry = LiveNodeScreenGeometry(
                 nodePosition: node.position,
@@ -1253,6 +1275,17 @@ public struct FlowCanvas<
         let transform = CGAffineTransform(scaleX: viewport.zoom, y: viewport.zoom)
             .concatenating(CGAffineTransform(translationX: viewport.offset.x, y: viewport.offset.y))
         return Path(path.cgPath.copy(using: [transform]) ?? path.cgPath)
+    }
+
+    private func nodeSymbolContent(_ node: FlowNode<NodeData>) -> some View {
+        let context = nodeRenderContext(for: node)
+        return nodeContentBuilder(node, context)
+            .environment(\.flowNodeRenderPhase, .rasterize)
+            .environment(\.flowNodeID, node.id)
+            .environment(\.isFlowNodeSelected, store.selectedNodeIDs.contains(node.id))
+            .environment(\.isFlowNodeHovered, store.hoveredNodeID == node.id)
+            .environment(\.isFlowNodeFocused, store.focusedTarget == .node(node.id))
+            .environment(\.liveNodeEnvironment, LiveNodeEnvironment(id: node.id, size: node.size, snapshot: context.snapshot))
     }
 
     private func nodeRenderContext(for node: FlowNode<NodeData>) -> NodeRenderContext {
