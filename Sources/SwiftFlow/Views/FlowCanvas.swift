@@ -1235,30 +1235,7 @@ public struct FlowCanvas<
     }
 
     private func computeEdgeGeometry(for edge: FlowEdge) -> EdgeGeometry? {
-        guard let source = store.handleInfo(nodeID: edge.sourceNodeID, handleID: edge.sourceHandleID),
-              let target = store.handleInfo(nodeID: edge.targetNodeID, handleID: edge.targetHandleID)
-        else { return nil }
-
-        let calculator = FlowStore<NodeData>.pathCalculator(for: edge.pathType)
-        let edgePath = calculator.path(
-            from: source.point, sourcePosition: source.position,
-            to: target.point, targetPosition: target.position
-        )
-
-        let rawBounds = edgePath.path.boundingRect.insetBy(dx: -20, dy: -20)
-        let offset = CGAffineTransform(translationX: -rawBounds.origin.x, y: -rawBounds.origin.y)
-        let translatedPath = Path(edgePath.path.cgPath.copy(using: [offset]) ?? edgePath.path.cgPath)
-
-        return EdgeGeometry(
-            path: translatedPath,
-            sourcePoint: CGPoint(x: source.point.x - rawBounds.origin.x, y: source.point.y - rawBounds.origin.y),
-            targetPoint: CGPoint(x: target.point.x - rawBounds.origin.x, y: target.point.y - rawBounds.origin.y),
-            sourcePosition: source.position,
-            targetPosition: target.position,
-            labelPosition: CGPoint(x: edgePath.labelPosition.x - rawBounds.origin.x, y: edgePath.labelPosition.y - rawBounds.origin.y),
-            labelAngle: edgePath.labelAngle,
-            bounds: rawBounds
-        )
+        store.edgeGeometry(for: edge)
     }
 
     @ViewBuilder

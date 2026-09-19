@@ -27,6 +27,9 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public private(set) var nodeSnapshots: [String: FlowNodeSnapshot] = [:]
     private var snapshotGeneration: Int = 0
 
+    // Derived geometry must not invalidate SwiftUI while a Canvas resolves symbols.
+    @ObservationIgnored var edgeGeometryCache = EdgeGeometryCache()
+
     // MARK: - Lookup Tables
 
     public private(set) var nodeLookup: [String: FlowNode<Data>] = [:]
@@ -1513,6 +1516,44 @@ public final class FlowStore<Data: Sendable & Hashable> {
         return HandleInfo(point: point, position: decl.position, type: decl.type)
     }
 
+    /// Canvas-space geometry is shared by symbol construction and drawing.
+    /// Only resolved endpoint geometry and routing type affect the path; viewport,
+    /// labels, selection and paint deliberately do not invalidate it.
+    func edgeGeometry(for edge: FlowEdge) -> EdgeGeometry? {
+        guard let source = handleInfo(nodeID: edge.sourceNodeID, handleID: edge.sourceHandleID),
+              let target = handleInfo(nodeID: edge.targetNodeID, handleID: edge.targetHandleID) else {
+            edgeGeometryCache.remove(edge.id)
+            return nil
+        }
+        let key = EdgeGeometryCache.Key(
+            sourcePoint: source.point, targetPoint: target.point,
+            sourcePosition: source.position, targetPosition: target.position,
+            pathType: edge.pathType
+        )
+        return edgeGeometryCache.resolve(edgeID: edge.id, key: key) {
+            let calculator = Self.pathCalculator(for: edge.pathType)
+            let edgePath = calculator.path(
+                from: source.point, sourcePosition: source.position,
+                to: target.point, targetPosition: target.position
+            )
+
+            let rawBounds = edgePath.path.boundingRect.insetBy(dx: -20, dy: -20)
+            let offset = CGAffineTransform(translationX: -rawBounds.origin.x, y: -rawBounds.origin.y)
+            let translatedPath = Path(edgePath.path.cgPath.copy(using: [offset]) ?? edgePath.path.cgPath)
+
+            return EdgeGeometry(
+                path: translatedPath,
+                sourcePoint: CGPoint(x: source.point.x - rawBounds.origin.x, y: source.point.y - rawBounds.origin.y),
+                targetPoint: CGPoint(x: target.point.x - rawBounds.origin.x, y: target.point.y - rawBounds.origin.y),
+                sourcePosition: source.position,
+                targetPosition: target.position,
+                labelPosition: CGPoint(x: edgePath.labelPosition.x - rawBounds.origin.x, y: edgePath.labelPosition.y - rawBounds.origin.y),
+                labelAngle: edgePath.labelAngle,
+                bounds: rawBounds
+            )
+        }
+    }
+
     func findNearestHandle(at canvasPoint: CGPoint, excludingNodeID: String, targetType: HandleType, threshold: CGFloat = 40) -> (nodeID: String, handleID: String)? {
         var bestDistance: CGFloat = threshold
         var bestResult: (nodeID: String, handleID: String)?
@@ -1891,6 +1932,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     private func rebuildConnectionLookup() {
+        edgeGeometryCache.retainEdges(Set(edges.map(\.id)))
         var lookup: [String: [FlowEdge]] = [:]
         for edge in edges {
             lookup[edge.sourceNodeID, default: []].append(edge)
@@ -1989,6 +2031,7 @@ extension FlowStore where Data: Codable {
         // pending interactive-update batch belongs to the old document.
         snapshotGeneration += 1
         nodeSnapshots.removeAll()
+        edgeGeometryCache.removeAll()
         nodeDragSession = nil
         pendingNodeChanges.removeAll()
         isInteractiveUpdateActive = false
