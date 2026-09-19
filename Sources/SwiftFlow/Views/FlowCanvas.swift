@@ -353,7 +353,13 @@ public struct FlowCanvas<
 
     @ViewBuilder
     private func canvasBody(in size: CGSize) -> some View {
-        let compositePlan = store.compositeNodePlan(roots: isLiveNodeOverlayEnabled ? [] : compositedRoots)
+        let liveIDs: Set<String> = isLiveNodeOverlayEnabled
+            ? liveNodeInteractionCoordinator.liveNodeIDs.union(store.nodes.compactMap {
+                liveNodeInteractionPredicate($0, store) ? $0.id : nil
+            }) : []
+        let compositePlan = store.compositeNodePlan(roots: NodeCompositePlan.rootsExcludingLiveNodes(
+            compositedRoots, nodes: store.nodes, liveIDs: liveIDs
+        ))
         let canvasView = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) { context, canvasSize in
             let selectionContext = SelectionContextResolver.resolve(
                 store: store,

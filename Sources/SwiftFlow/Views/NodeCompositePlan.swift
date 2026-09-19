@@ -2,6 +2,25 @@ import SwiftUI
 
 /// Rendering only: every member remains in FlowStore for interaction and persistence.
 struct NodeCompositePlan {
+    /// Live content and every containing batch must stay on the individual path.
+    /// Unrelated subtrees can remain composited while an editor is mounted.
+    static func rootsExcludingLiveNodes<Data: Sendable & Hashable>(
+        _ roots: Set<String>, nodes: [FlowNode<Data>], liveIDs: Set<String>
+    ) -> Set<String> {
+        guard !roots.isEmpty, !liveIDs.isEmpty else { return roots }
+        let parents = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.parentID) })
+        var result = roots
+        for liveID in liveIDs {
+            var cursor: String? = liveID
+            var visited = Set<String>()
+            while let id = cursor, visited.insert(id).inserted {
+                result.remove(id)
+                cursor = parents[id] ?? nil
+            }
+        }
+        return result
+    }
+
     struct Batch: Identifiable {
         let id: String
         let members: [String]

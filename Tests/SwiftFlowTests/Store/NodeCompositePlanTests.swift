@@ -14,6 +14,23 @@ struct NodeCompositePlanTests {
         return FlowStore(nodes: nodes)
     }
 
+    @Test func liveEditorExpandsOnlyContainingBatches() {
+        let store = table()
+        let roots: Set<String> = ["table", "cell0", "cell1"]
+        let eligible = NodeCompositePlan.rootsExcludingLiveNodes(
+            roots, nodes: store.nodes, liveIDs: ["text0"]
+        )
+        #expect(eligible == ["cell1"])
+        // Separate this sibling spatially so the painter-order safeguard does
+        // not intentionally reject its padded bounds against adjacent cells.
+        store.updateNode("cell1") { $0.position = CGPoint(x: 2000, y: 0) }
+        store.updateNode("text1") { $0.position = CGPoint(x: 2000, y: 0) }
+        #expect(store.compositeNodePlan(roots: eligible).batches.map(\.id) == ["cell1"])
+        #expect(NodeCompositePlan.rootsExcludingLiveNodes(
+            roots, nodes: store.nodes, liveIDs: []
+        ) == roots)
+    }
+
     @Test func tableBecomesOneSymbolWithoutRemovingNodes() throws {
         let store = table()
         let plan = store.compositeNodePlan(roots: ["table", "cell0"])
