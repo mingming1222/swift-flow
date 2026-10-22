@@ -154,4 +154,17 @@ struct NodeCompositePlanTests {
         #expect(store.nodesInHitTestOrder.last?.id == "outer")
     }
 
+    @Test func aStandaloneClosedComponentUsesTheSameCachedSymbolPath() throws {
+        let store = FlowStore(nodes: [FlowNode(id: "component", position: .zero, data: "AST content")])
+        #expect(store.compositeNodePlan(roots: ["component"]).batches.isEmpty)
+        let atomic = try #require(store.compositeNodePlan(roots: ["component"], atomic: true).batches.first)
+        #expect(atomic.members == ["component"])
+        #expect(atomic.drawAtID == "component")
+        store.beginNodeDrag("component")
+        store.configuration.snapToGrid = false
+        store.updateNodeDrag(translation: CGSize(width: 90, height: 30))
+        let moved = try #require(store.compositeNodePlan(roots: ["component"], atomic: true).batches.first)
+        #expect(moved.bounds == atomic.bounds.offsetBy(dx: 90, dy: 30))
+    }
+
 }

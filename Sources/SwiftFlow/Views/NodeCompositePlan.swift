@@ -61,7 +61,7 @@ struct NodeCompositePlan {
         // overlapping outsider would change painter order, so retain separate
         // symbols in that case. Non-overlapping interleaving is safe to batch.
         for root in roots.sorted() {
-            guard let group = members[root], group.count > 1, let end = lastIndex[root] else { continue }
+            guard let group = members[root], (atomic || group.count > 1), let end = lastIndex[root] else { continue }
             var crossedBounds = CGRect.null
             var safe = true
             for node in ordered[...end] {
