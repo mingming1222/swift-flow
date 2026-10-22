@@ -132,13 +132,21 @@ public final class FlowStore<Data: Sendable & Hashable> {
         guard !atomicCompositeRootIDs.isEmpty else { return nodeIndicesHitTestOrder }
         let plan = compositeNodePlan(roots: atomicCompositeRootIDs, atomic: true)
         let indices = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($0.element.id, $0.offset) })
-        return nodeIndicesFrontToBack.flatMap { index -> [Int] in
+        let ordered = nodeIndicesFrontToBack.flatMap { index -> [Int] in
             let id = nodes[index].id
             if let batch = plan.batchAtNodeID[id] {
                 return batch.members.reversed().compactMap { indices[$0] }
             }
             return plan.memberIDs.contains(id) ? [] : [index]
         }
+        // Entered containers retain their background but must not mask their
+        // descendants' interaction targets, even with a higher authored zIndex.
+        return ordered.enumerated().sorted { lhs, rhs in
+            let left = nodes[lhs.element].id, right = nodes[rhs.element].id
+            if isAncestor(left, of: right) { return false }
+            if isAncestor(right, of: left) { return true }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
     }
 
     // MARK: - Hierarchy

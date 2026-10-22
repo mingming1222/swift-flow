@@ -143,4 +143,15 @@ struct NodeCompositePlanTests {
         #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "outside")
     }
 
+    @Test func enteredAncestorDoesNotMaskAClosedNestedGroup() {
+        let store = FlowStore(nodes: [
+            FlowNode(id: "outer", position: .zero, data: "Outer", zIndex: 10),
+            FlowNode(id: "inner", position: .zero, data: "Inner", parentID: "outer"),
+            FlowNode(id: "leaf", position: .zero, data: "Leaf", parentID: "inner")
+        ])
+        store.atomicCompositeRootIDs = ["inner"]
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "leaf")
+        #expect(store.nodesInHitTestOrder.last?.id == "outer")
+    }
+
 }
