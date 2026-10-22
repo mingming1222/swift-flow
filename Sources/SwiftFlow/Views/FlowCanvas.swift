@@ -27,6 +27,8 @@ public struct FlowCanvas<
     }
     private var hoverExclusionRegions: [CanvasHoverRegion] = []
     private var compositedRoots: Set<String> = []
+    private var compositeContentVersion: UInt64?
+    private var atomicCompositeGroups = false
 
     /// Combines each requested subtree into one Canvas symbol while keeping
     /// every node available for hit testing, accessibility and document updates.
@@ -34,6 +36,17 @@ public struct FlowCanvas<
     public func compositedNodeRoots(_ roots: Set<String>) -> Self {
         var copy = self
         copy.compositedRoots = roots
+        return copy
+    }
+
+    /// Render store.atomicCompositeRootIDs as atomic units and reuse their
+    /// symbol content across translations. Increment contentVersion for inputs
+    /// captured by nodeContent that are not represented in FlowNode or its context.
+    /// Opt-in builders must render translation-invariant local content.
+    public func atomicCompositedNodes(contentVersion: UInt64) -> Self {
+        var copy = self
+        copy.compositeContentVersion = contentVersion
+        copy.atomicCompositeGroups = true
         return copy
     }
 
@@ -358,8 +371,8 @@ public struct FlowCanvas<
                 liveNodeInteractionPredicate($0, store) ? $0.id : nil
             }) : []
         let compositePlan = store.compositeNodePlan(roots: NodeCompositePlan.rootsExcludingLiveNodes(
-            compositedRoots, nodes: store.nodes, liveIDs: liveIDs
-        ))
+            atomicCompositeGroups ? store.atomicCompositeRootIDs : compositedRoots, nodes: store.nodes, liveIDs: liveIDs
+        ), atomic: atomicCompositeGroups)
         let canvasView = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) { context, canvasSize in
             let selectionContext = SelectionContextResolver.resolve(
                 store: store,
@@ -381,6 +394,19 @@ public struct FlowCanvas<
                 nodeSymbolContent(node).tag(node.id)
             }
             ForEach(compositePlan.batches) { batch in
+                if let compositeContentVersion {
+                    CompositeNodeContent(
+                        nodes: batch.members.compactMap { store.nodeLookup[$0] },
+                        contexts: batch.members.compactMap { store.nodeLookup[$0].map(nodeRenderContext) },
+                        bounds: batch.bounds,
+                        contentVersion: compositeContentVersion,
+                        hoveredID: store.hoveredNodeID,
+                        focusedTarget: store.focusedTarget,
+                        content: nodeSymbolContent
+                    )
+                    .equatable()
+                    .tag(CompositeNodeSymbolID(rootID: batch.id))
+                } else {
                 ZStack(alignment: .topLeading) {
                     ForEach(batch.members, id: \.self) { nodeID in
                         if let node = store.nodeLookup[nodeID] {
@@ -394,6 +420,7 @@ public struct FlowCanvas<
                 }
                 .frame(width: batch.bounds.width, height: batch.bounds.height)
                 .tag(CompositeNodeSymbolID(rootID: batch.id))
+                }
             }
             if let edgeContentBuilder {
                 ForEach(store.edges) { edge in
@@ -1394,3 +1421,39 @@ private enum DragCursorKind: Equatable {
     }
 }
 #endif
+
+/// The local signature deliberately excludes a common world translation.
+/// Geometry is applied by drawNodes; content/style/state still invalidate pixels.
+struct CompositeNodeContent<Data: Sendable & Hashable, Content: View>: View, Equatable {
+    let nodes: [FlowNode<Data>]
+    let contexts: [NodeRenderContext]
+    let bounds: CGRect
+    let contentVersion: UInt64
+    let hoveredID: String?
+    let focusedTarget: FlowFocusTarget?
+    let content: (FlowNode<Data>) -> Content
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        guard lhs.contentVersion == rhs.contentVersion, lhs.bounds.size == rhs.bounds.size,
+              lhs.contexts == rhs.contexts, lhs.hoveredID == rhs.hoveredID,
+              lhs.focusedTarget == rhs.focusedTarget, lhs.nodes.count == rhs.nodes.count else { return false }
+        return zip(lhs.nodes, rhs.nodes).allSatisfy { left, right in
+            var a = left, b = right
+            a.position = CGPoint(x: a.position.x - lhs.bounds.minX, y: a.position.y - lhs.bounds.minY)
+            b.position = CGPoint(x: b.position.x - rhs.bounds.minX, y: b.position.y - rhs.bounds.minY)
+            return a == b
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(nodes) { node in
+                content(node)
+                    .frame(width: node.size.width + FlowHandle.diameter,
+                           height: node.size.height + FlowHandle.diameter)
+                    .position(x: node.frame.midX - bounds.minX, y: node.frame.midY - bounds.minY)
+            }
+        }
+        .frame(width: bounds.width, height: bounds.height)
+    }
+}

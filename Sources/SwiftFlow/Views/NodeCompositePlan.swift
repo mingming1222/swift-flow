@@ -31,7 +31,7 @@ struct NodeCompositePlan {
     let memberIDs: Set<String>
     let batchAtNodeID: [String: Batch]
 
-    init<Data: Sendable & Hashable>(nodes: [FlowNode<Data>], backToFront: [Int], roots: Set<String>, inset: CGFloat) {
+    init<Data: Sendable & Hashable>(nodes: [FlowNode<Data>], backToFront: [Int], roots: Set<String>, inset: CGFloat, atomic: Bool = false) {
         guard !roots.isEmpty else {
             batches = []; memberIDs = []; batchAtNodeID = [:]; return
         }
@@ -68,7 +68,7 @@ struct NodeCompositePlan {
                 let frame = node.frame.insetBy(dx: -inset, dy: -inset)
                 if owner[node.id] == root {
                     crossedBounds = crossedBounds.union(frame)
-                } else if !crossedBounds.isNull && crossedBounds.intersects(frame) {
+                } else if !atomic && !crossedBounds.isNull && crossedBounds.intersects(frame) {
                     safe = false; break
                 }
             }
@@ -80,6 +80,22 @@ struct NodeCompositePlan {
         memberIDs = Set(result.flatMap(\.members))
         batchAtNodeID = Dictionary(uniqueKeysWithValues: result.map { ($0.drawAtID, $0) })
     }
+    private init(batches: [Batch], memberIDs: Set<String>) {
+        self.batches = batches
+        self.memberIDs = memberIDs
+        batchAtNodeID = Dictionary(uniqueKeysWithValues: batches.map { ($0.drawAtID, $0) })
+    }
+
+    func positioned<Data: Sendable & Hashable>(in lookup: [String: FlowNode<Data>], inset: CGFloat) -> Self {
+        Self(batches: batches.map { batch in
+            let bounds = batch.members.reduce(CGRect.null) { bounds, id in
+                guard let node = lookup[id] else { return bounds }
+                return bounds.union(node.frame.insetBy(dx: -inset, dy: -inset))
+            }
+            return Batch(id: batch.id, members: batch.members, bounds: bounds, drawAtID: batch.drawAtID)
+        }, memberIDs: memberIDs)
+    }
+
 }
 
 struct CompositeNodeSymbolID: Hashable {
@@ -95,6 +111,7 @@ struct NodeCompositePlanCache {
         let frame: CGRect
         let zIndex: Int
     }
+    var atomic = false
     var inputs: [Input] = []
     var roots: Set<String> = []
     var plan: NodeCompositePlan?

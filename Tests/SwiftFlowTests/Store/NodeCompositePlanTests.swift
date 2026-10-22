@@ -81,4 +81,66 @@ struct NodeCompositePlanTests {
         store.load(document)
         #expect(store.nodeLookup["text0"]?.parentID == nil)
     }
+    @Test func atomicGroupsStayOneSymbolAcrossInterleavingAndRigidMovement() throws {
+        let store = table()
+        store.addNode(FlowNode(id: "outside", position: CGPoint(x: 15, y: 15), data: "Outside", zIndex: -1))
+        let before = try #require(store.compositeNodePlan(roots: ["table", "cell0"], atomic: true).batches.first)
+        let ids = store.nodes.map(\.id)
+        var deliveries = [[NodeChange<String>]]()
+        store.onNodesChange = { deliveries.append($0) }
+        store.configuration.snapToGrid = false
+        store.beginNodeDrag("table")
+        store.updateNodeDrag(translation: CGSize(width: 150, height: 70))
+        #expect(deliveries.count == 1)
+        #expect(deliveries[0].count == 41)
+        let moved = try #require(store.compositeNodePlan(roots: ["table", "cell0"], atomic: true).batches.first)
+        #expect(moved.members == before.members)
+        #expect(moved.bounds == before.bounds.offsetBy(dx: 150, dy: 70))
+        #expect(store.nodes.map(\.id) == ids)
+        #expect(store.nodeLookup["outside"]?.position == CGPoint(x: 15, y: 15))
+        store.updateNodeDrag(translation: CGSize(width: 150, height: 70))
+        #expect(deliveries.count == 1, "Repeated pointer samples must not publish unchanged geometry")
+    }
+
+    @Test func symbolPixelsInvalidateForContentAndRelativeGeometryButNotTranslation() throws {
+        let store = table()
+        let batch = try #require(store.compositeNodePlan(roots: ["table"], atomic: true).batches.first)
+        func symbol(_ nodes: [FlowNode<String>], _ bounds: CGRect, version: UInt64 = 1) -> CompositeNodeContent<String, Text> {
+            CompositeNodeContent(nodes: nodes, contexts: [], bounds: bounds,
+                contentVersion: version, hoveredID: nil, focusedTarget: nil,
+                content: { Text($0.data) })
+        }
+        let original = symbol(store.nodes, batch.bounds)
+        let translated = store.nodes.map { node in
+            var result = node
+            result.position.x += 120
+            result.position.y -= 60
+            return result
+        }
+        #expect(original == symbol(translated, batch.bounds.offsetBy(dx: 120, dy: -60)))
+        var edited = translated
+        edited[1].data = "New cell content"
+        #expect(original != symbol(edited, batch.bounds.offsetBy(dx: 120, dy: -60)))
+        edited = translated
+        edited[1].position.x += 1
+        #expect(original != symbol(edited, batch.bounds.offsetBy(dx: 120, dy: -60)))
+        #expect(original != symbol(store.nodes, batch.bounds, version: 2))
+    }
+
+    @Test func atomicHitTestingUsesTheSameBoundaryAsPainterOrderAndExpandsOnEntry() {
+        let nodes = [
+            FlowNode(id: "group", position: .zero, size: CGSize(width: 200, height: 100), data: "Group", zIndex: -2),
+            FlowNode(id: "first", position: .zero, size: CGSize(width: 80, height: 80), data: "First", parentID: "group", zIndex: -1),
+            FlowNode(id: "outside", position: .zero, size: CGSize(width: 80, height: 80), data: "Outside", zIndex: 0),
+            FlowNode(id: "last", position: CGPoint(x: 100, y: 0), size: CGSize(width: 80, height: 80), data: "Last", parentID: "group", zIndex: 1)
+        ]
+        let store = FlowStore(nodes: nodes)
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "outside")
+        store.atomicCompositeRootIDs = ["group"]
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "first")
+        #expect(store.nodesInHitTestOrder.map(\.id) == ["last", "first", "group", "outside"])
+        store.atomicCompositeRootIDs = []
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "outside")
+    }
+
 }

@@ -17,6 +17,9 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public private(set) var activeInteraction: FlowActiveInteraction?
     public private(set) var dropTargetNodeID: String?
     public private(set) var dropTargetEdgeID: String?
+    /// Closed visual subtrees share one painter-order and hit-test boundary.
+    /// Node identity and geometry remain independent in the store.
+    public var atomicCompositeRootIDs: Set<String> = []
     public var configuration: FlowConfiguration
 
     /// Rasterized snapshots keyed by node id, used by the Canvas rasterize
@@ -103,19 +106,39 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     /// Viewport changes do not rebuild subtree ownership or painter-order checks.
-    func compositeNodePlan(roots: Set<String>) -> NodeCompositePlan {
+    func compositeNodePlan(roots: Set<String>, atomic: Bool = false) -> NodeCompositePlan {
         guard !roots.isEmpty else {
             return NodeCompositePlan(nodes: nodes, backToFront: [], roots: [], inset: 0)
         }
         let inputs = nodes.map { NodeCompositePlanCache.Input(
-            id: $0.id, parentID: $0.parentID, frame: $0.frame, zIndex: $0.zIndex
+            id: $0.id, parentID: $0.parentID, frame: atomic ? .zero : $0.frame, zIndex: $0.zIndex
         ) }
         if nodeCompositePlanCache.inputs == inputs, nodeCompositePlanCache.roots == roots,
-           let plan = nodeCompositePlanCache.plan { return plan }
+           nodeCompositePlanCache.atomic == atomic, let plan = nodeCompositePlanCache.plan {
+            return atomic ? plan.positioned(in: nodeLookup, inset: FlowHandle.diameter / 2) : plan
+        }
         let plan = NodeCompositePlan(nodes: nodes, backToFront: Array(nodeIndicesFrontToBack.reversed()),
-                                     roots: roots, inset: FlowHandle.diameter / 2)
-        nodeCompositePlanCache = NodeCompositePlanCache(inputs: inputs, roots: roots, plan: plan)
+                                     roots: roots, inset: FlowHandle.diameter / 2, atomic: atomic)
+        nodeCompositePlanCache = NodeCompositePlanCache(atomic: atomic, inputs: inputs, roots: roots, plan: plan)
         return plan
+    }
+
+    /// Front-to-back interaction order matching atomic subtree drawing.
+    public var nodesInHitTestOrder: [FlowNode<Data>] {
+        interactionNodeIndices.map { nodes[$0] }
+    }
+
+    private var interactionNodeIndices: [Int] {
+        guard !atomicCompositeRootIDs.isEmpty else { return nodeIndicesHitTestOrder }
+        let plan = compositeNodePlan(roots: atomicCompositeRootIDs, atomic: true)
+        let indices = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($0.element.id, $0.offset) })
+        return nodeIndicesFrontToBack.flatMap { index -> [Int] in
+            let id = nodes[index].id
+            if let batch = plan.batchAtNodeID[id] {
+                return batch.members.reversed().compactMap { indices[$0] }
+            }
+            return plan.memberIDs.contains(id) ? [] : [index]
+        }
     }
 
     // MARK: - Hierarchy
@@ -619,12 +642,25 @@ public final class FlowStore<Data: Sendable & Hashable> {
         let zoom = viewport.zoom
         let dx = translation.width / zoom
         let dy = translation.height / zoom
-        for (nodeID, start) in session.startPositions {
-            moveNode(nodeID, to: CGPoint(
-                x: start.x + dx,
-                y: start.y + dy
-            ))
+        // Publish one coherent geometry value per pointer sample. Looking up
+        // every descendant with firstIndex made a group drag O(moving * all).
+        var nextNodes = nodes
+        var nextLookup = nodeLookup
+        var changes: [NodeChange<Data>] = []
+        for index in nextNodes.indices {
+            let id = nextNodes[index].id
+            guard let start = session.startPositions[id] else { continue }
+            let position = configuration.snapped(CGPoint(x: start.x + dx, y: start.y + dy))
+            guard nextNodes[index].position != position else { continue }
+            nextNodes[index].position = position
+            nextLookup[id] = nextNodes[index]
+            nodePositionAnimations.removeValue(forKey: id)
+            changes.append(.position(nodeID: id, position: position))
         }
+        guard !changes.isEmpty else { return }
+        nodes = nextNodes
+        nodeLookup = nextLookup
+        emitNodeChanges(changes)
     }
 
     /// Finalize the active session: registers a single multi-node undo
@@ -1575,7 +1611,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         var bestDistance: CGFloat = threshold
         var bestResult: (nodeID: String, handleID: String)?
 
-        for index in nodeIndicesHitTestOrder {
+        for index in interactionNodeIndices {
             let node = nodes[index]
             guard node.id != excludingNodeID else { continue }
             for handle in node.handles {
@@ -1600,7 +1636,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         var bestDistance: CGFloat = threshold
         var bestResult: HandleHitResult?
 
-        for index in nodeIndicesHitTestOrder {
+        for index in interactionNodeIndices {
             let node = nodes[index]
             for handle in node.handles {
                 let area = handle.connectionStartArea ?? .point(radius: threshold)
@@ -1623,7 +1659,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     func hitTestNode(at canvasPoint: CGPoint) -> String? {
-        for index in nodeIndicesHitTestOrder {
+        for index in interactionNodeIndices {
             if nodes[index].frame.contains(canvasPoint) {
                 return nodes[index].id
             }
