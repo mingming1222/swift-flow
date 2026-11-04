@@ -5,6 +5,23 @@ import Testing
 @MainActor
 struct LiveNodeInteractionCoordinatorTests {
 
+    @Test("Known candidates preserve unevaluated nodes and reconcile departures and deletion")
+    func knownCandidatesReconcileLifecycle() {
+        let coordinator = LiveNodeInteractionCoordinator()
+        #expect(LiveNodeCandidateScope.evaluated(nil, previouslyDiscovered: []) == nil)
+        coordinator.applyPreferences(evaluated: ["persistent", "other"], present: ["persistent", "other"],
+            policies: ["persistent": .persistent, "other": .onInteraction], storeNodeIDs: ["persistent", "other"])
+        let scope = LiveNodeCandidateScope.evaluated(["persistent", "new"], previouslyDiscovered: coordinator.liveNodeIDs)!
+        #expect(scope == ["persistent", "other", "new"])
+        coordinator.applyPreferences(evaluated: scope, present: ["persistent", "new"],
+            policies: ["persistent": .persistent, "new": .onInteraction], storeNodeIDs: ["persistent", "other", "new"])
+        #expect(coordinator.liveNodeIDs == ["persistent", "new"])
+        coordinator.applyPreferences(evaluated: ["new"], present: ["new"], policies: ["new": .onInteraction],
+            storeNodeIDs: ["new"])
+        #expect(coordinator.liveNodeIDs == ["new"])
+        #expect(coordinator.liveNodeMountPolicies["persistent"] == nil)
+    }
+
     @Test("Atomic preferences replace scoped entries and preserve outside scope")
     func atomicPreferencesReplaceScopedEntriesAndPreserveOutsideScope() {
         let coordinator = LiveNodeInteractionCoordinator()

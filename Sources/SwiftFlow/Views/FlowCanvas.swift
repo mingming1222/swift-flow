@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+
 import UniformTypeIdentifiers
 
 public struct FlowCanvas<
@@ -22,6 +23,7 @@ public struct FlowCanvas<
     private var selectionDecorationDrawers: [SelectionDecorationDrawer<NodeData>] = []
     private var selectionAccessoryBuilders: [SelectionAccessoryBuilder<NodeData>] = []
     private var liveNodeSupport: LiveNodeSupport = .enabled
+    private var knownLiveNodeCandidates: Set<String>?
     private var liveNodeInteractionPredicate: (FlowNode<NodeData>, FlowStore<NodeData>) -> Bool = { node, store in
         store.hoveredNodeID == node.id
     }
@@ -29,7 +31,44 @@ public struct FlowCanvas<
     private var compositedRoots: Set<String> = []
     private var compositeContentVersion: UInt64?
     private var compositeContentVersionForMembers: ((String, [FlowNode<NodeData>]) -> UInt64)?
+    private var preparedCompositeIDsObserver: ((Set<String>) -> Void)?
     private var atomicCompositeGroups = false
+    private var viewportCullingConfiguration: ViewportCullingConfiguration<NodeData>?
+    private var rendersEdges = true
+
+    /// Suppress the built-in edge layer when a caller draws edges separately.
+    /// Connection drafts, selection and Store edge semantics remain intact.
+    public func rendersEdges(_ enabled: Bool) -> Self {
+        var copy = self
+        copy.rendersEdges = enabled
+        return copy
+    }
+
+    /// Opt in only when the caller can provide conservative visual coverage.
+    /// Unknown bounds and explicitly retained IDs are never dropped.
+    public func viewportCulling(preloadMargin: CGFloat = 100, retainedNodeIDs: Set<String> = [],
+                                visualBounds: @escaping (FlowNode<NodeData>) -> FlowVisualBounds) -> Self {
+        var copy = self
+        copy.viewportCullingConfiguration = .init(preloadMargin: preloadMargin,
+            retainedNodeIDs: retainedNodeIDs, visualBounds: visualBounds)
+        return copy
+    }
+
+    /// Restrict live-node discovery to a caller's complete set of candidates.
+    /// Omit to keep the generic all-node discovery behavior.
+    public func liveNodeCandidates(_ ids: Set<String>) -> Self {
+        var copy = self
+        copy.knownLiveNodeCandidates = ids
+        return copy
+    }
+
+    /// Inform a caller-owned, non-observable presentation cache which complete
+    /// batches are prepared. The callback must not update SwiftUI state.
+    public func onPreparedCompositeIDs(_ observer: @escaping (Set<String>) -> Void) -> Self {
+        var copy = self
+        copy.preparedCompositeIDsObserver = observer
+        return copy
+    }
 
     /// Combines each requested subtree into one Canvas symbol while keeping
     /// every node available for hit testing, accessibility and document updates.
@@ -52,10 +91,6 @@ public struct FlowCanvas<
         return copy
     }
 
-    private var deleteActionHandler: ((FlowStore<NodeData>) -> Bool)?
-    private var registeredDropTypes: [String] = []
-    private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
-
     /// A caller that can describe captured inputs per complete batch can keep
     /// unrelated symbols stable. The callback must include every non-node
     /// input affecting that batch, including any live callback context.
@@ -66,6 +101,10 @@ public struct FlowCanvas<
         copy.atomicCompositeGroups = true
         return copy
     }
+
+    private var deleteActionHandler: ((FlowStore<NodeData>) -> Bool)?
+    private var registeredDropTypes: [String] = []
+    private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
 
     /// Excludes editor controls from node hover and node cursor resolution.
     /// Pass actual visible control regions in canvas screen coordinates.
@@ -381,11 +420,21 @@ public struct FlowCanvas<
     private func canvasBody(in size: CGSize) -> some View {
         let liveIDs: Set<String> = isLiveNodeOverlayEnabled
             ? liveNodeInteractionCoordinator.liveNodeIDs.union(store.nodes.compactMap {
-                liveNodeInteractionPredicate($0, store) ? $0.id : nil
+                (knownLiveNodeCandidates?.contains($0.id) ?? true) && liveNodeInteractionPredicate($0, store) ? $0.id : nil
             }) : []
         let compositePlan = store.compositeNodePlan(roots: NodeCompositePlan.rootsExcludingLiveNodes(
             atomicCompositeGroups ? store.atomicCompositeRootIDs : compositedRoots, nodes: store.nodes, liveIDs: liveIDs
         ), atomic: atomicCompositeGroups)
+        let viewportPlan = viewportCullingConfiguration.map { configuration in
+            FlowViewportRenderPlan(nodes: store.nodes, backToFront: Array(store.nodeIndicesFrontToBack.reversed()),
+                composite: compositePlan, viewport: store.viewport, canvasSize: size,
+                preloadMargin: configuration.preloadMargin, retainedIDs: configuration.retainedNodeIDs,
+                visualBounds: configuration.visualBounds)
+        }
+        let preparedNodes = viewportPlan.map { $0.preparedNodeIndices.map { store.nodes[$0] } }
+            ?? store.nodes.filter { !compositePlan.memberIDs.contains($0.id) }
+        let preparedBatches = viewportPlan?.preparedBatches ?? compositePlan.batches
+        let _ = preparedCompositeIDsObserver?(Set(preparedBatches.map(\.id)))
         let canvasView = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) { context, canvasSize in
             let selectionContext = SelectionContextResolver.resolve(
                 store: store,
@@ -393,20 +442,22 @@ public struct FlowCanvas<
             )
             drawBackground(context: &context, canvasSize: canvasSize)
             drawSelectionDecorations(layer: .background, context: &context, selection: selectionContext)
-            if edgeContentBuilder != nil {
-                drawEdgesViaSymbols(context: &context, canvasSize: canvasSize)
-            } else {
-                drawEdgesViaGraphicsContext(context: &context, canvasSize: canvasSize)
+            if rendersEdges {
+                if edgeContentBuilder != nil {
+                    drawEdgesViaSymbols(context: &context, canvasSize: canvasSize)
+                } else {
+                    drawEdgesViaGraphicsContext(context: &context, canvasSize: canvasSize)
+                }
             }
             drawConnectionDraft(context: &context, canvasSize: canvasSize)
-            drawNodes(context: &context, canvasSize: canvasSize, compositePlan: compositePlan)
+            drawNodes(context: &context, canvasSize: canvasSize, compositePlan: compositePlan, viewportPlan: viewportPlan)
             drawSelectionDecorations(layer: .overlay, context: &context, selection: selectionContext)
             drawSelectionRect(context: &context)
         } symbols: {
-            ForEach(store.nodes.filter { !compositePlan.memberIDs.contains($0.id) }) { node in
+            ForEach(preparedNodes) { node in
                 nodeSymbolContent(node).tag(node.id)
             }
-            ForEach(compositePlan.batches) { batch in
+            ForEach(preparedBatches) { batch in
                 let members = batch.members.compactMap { store.nodeLookup[$0] }
                 let localVersion = compositeContentVersionForMembers?(batch.id, members)
                 if let contentVersion = localVersion ?? compositeContentVersion {
@@ -425,22 +476,22 @@ public struct FlowCanvas<
                     .equatable()
                     .tag(CompositeNodeSymbolID(rootID: batch.id))
                 } else {
-                ZStack(alignment: .topLeading) {
-                    ForEach(batch.members, id: \.self) { nodeID in
-                        if let node = store.nodeLookup[nodeID] {
-                            let inset = FlowHandle.diameter / 2
-                            nodeSymbolContent(node)
-                                .frame(width: node.size.width + inset * 2, height: node.size.height + inset * 2)
-                                .position(x: node.frame.midX - batch.bounds.minX,
-                                          y: node.frame.midY - batch.bounds.minY)
+                    ZStack(alignment: .topLeading) {
+                        ForEach(batch.members, id: \.self) { nodeID in
+                            if let node = store.nodeLookup[nodeID] {
+                                let inset = FlowHandle.diameter / 2
+                                nodeSymbolContent(node)
+                                    .frame(width: node.size.width + inset * 2, height: node.size.height + inset * 2)
+                                    .position(x: node.frame.midX - batch.bounds.minX,
+                                              y: node.frame.midY - batch.bounds.minY)
+                            }
                         }
                     }
-                }
-                .frame(width: batch.bounds.width, height: batch.bounds.height)
-                .tag(CompositeNodeSymbolID(rootID: batch.id))
+                    .frame(width: batch.bounds.width, height: batch.bounds.height)
+                    .tag(CompositeNodeSymbolID(rootID: batch.id))
                 }
             }
-            if let edgeContentBuilder {
+            if rendersEdges, let edgeContentBuilder {
                 ForEach(store.edges) { edge in
                     edgeSymbolView(edge: edge, builder: edgeContentBuilder)
                 }
@@ -542,6 +593,8 @@ public struct FlowCanvas<
                 LiveNodeOverlay(
                     store: store,
                     canvasSize: size,
+                    knownCandidates: knownLiveNodeCandidates,
+                    retainedNodeIDs: viewportCullingConfiguration?.retainedNodeIDs ?? [],
                     nodeContent: nodeContentBuilder,
                     renderContext: { node in nodeRenderContext(for: node) },
                     interaction: liveNodeInteractionPredicate,
@@ -630,6 +683,8 @@ public struct FlowCanvas<
                 LiveNodeOverlay(
                     store: store,
                     canvasSize: size,
+                    knownCandidates: knownLiveNodeCandidates,
+                    retainedNodeIDs: viewportCullingConfiguration?.retainedNodeIDs ?? [],
                     nodeContent: nodeContentBuilder,
                     renderContext: { node in nodeRenderContext(for: node) },
                     interaction: liveNodeInteractionPredicate,
@@ -889,7 +944,8 @@ public struct FlowCanvas<
 
     // MARK: - Drawing: Nodes
 
-    private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize, compositePlan: NodeCompositePlan) {
+    private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize, compositePlan: NodeCompositePlan,
+                           viewportPlan: FlowViewportRenderPlan?) {
         let viewport = store.viewport
         let margin: CGFloat = 100
 
@@ -897,51 +953,57 @@ public struct FlowCanvas<
         // that sit on the node border (half in, half out).
         let handleInset = FlowHandle.diameter / 2
 
-        // Iterate back-to-front (reverse of front-to-back cache) for correct draw order
-        for index in store.nodeIndicesFrontToBack.reversed() {
-            let node = store.nodes[index]
-            if let batch = compositePlan.batchAtNodeID[node.id] {
+        let units: [FlowViewportRenderPlan.Unit]
+        if let viewportPlan {
+            units = viewportPlan.drawUnits
+        } else {
+            units = store.nodeIndicesFrontToBack.reversed().flatMap { index -> [FlowViewportRenderPlan.Unit] in
+                let node = store.nodes[index]
+                if let batch = compositePlan.batchAtNodeID[node.id] { return [.batch(batch)] }
+                return compositePlan.memberIDs.contains(node.id) ? [] : [.node(index)]
+            }
+        }
+        for unit in units {
+            switch unit {
+            case let .batch(batch):
                 let bounds = batch.bounds
                 let rect = CGRect(origin: viewport.canvasToScreen(bounds.origin),
                                   size: CGSize(width: bounds.width * viewport.zoom, height: bounds.height * viewport.zoom))
-                if CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin).intersects(rect),
-                   let symbol = context.resolveSymbol(id: CompositeNodeSymbolID(rootID: batch.id)) {
-                    context.draw(symbol, in: rect)
+                if viewportPlan != nil || CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin).intersects(rect) {
+                    if let symbol = context.resolveSymbol(id: CompositeNodeSymbolID(rootID: batch.id)) {
+                        context.draw(symbol, in: rect)
+                    }
                 }
-            }
-            if compositePlan.memberIDs.contains(node.id) { continue }
-
-            let geometry = LiveNodeScreenGeometry(
-                nodePosition: node.position,
-                nodeSize: node.size,
-                viewport: viewport,
-                handleInset: handleInset
-            )
-
-            // Viewport culling
-            let visibleRect = CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin)
-            guard visibleRect.intersects(geometry.drawRect) else { continue }
-
-            if isLiveNodeOverlayEnabled {
-                // Canvas and overlay resolve the same presentation state. This
-                // makes drawing ownership exclusive during warmup, interaction,
-                // capture handoff, failure, and viewport gestures.
-                let presentationState = LiveNodePresentationState(
-                    isLiveNode: liveNodeInteractionCoordinator.liveNodeIDs.contains(node.id),
-                    hasSnapshot: store.nodeSnapshots[node.id] != nil,
-                    mountPolicy: liveNodeInteractionCoordinator.mountPolicy(for: node.id),
-                    hasInteractionIntent: liveNodeInteractionPredicate(node, store),
-                    keepsOverlayVisibleForHandoff: liveNodeInteractionCoordinator
-                        .isRenderedInteractive(node.id),
-                    isViewportInteracting: isViewportInteracting
+            case let .node(index):
+                let node = store.nodes[index]
+                let geometry = LiveNodeScreenGeometry(
+                    nodePosition: node.position,
+                    nodeSize: node.size,
+                    viewport: viewport,
+                    handleInset: handleInset
                 )
-                if presentationState.suppressesCanvas {
-                    continue
-                }
-            }
 
-            if let resolved = context.resolveSymbol(id: node.id) {
-                context.draw(resolved, in: geometry.drawRect)
+                let visibleRect = CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin)
+                guard viewportPlan != nil || visibleRect.intersects(geometry.drawRect) else { continue }
+
+                if isLiveNodeOverlayEnabled {
+                    // Canvas and overlay share drawing ownership through warmup,
+                    // interaction, capture handoff, failure and viewport gestures.
+                    let presentationState = LiveNodePresentationState(
+                        isLiveNode: liveNodeInteractionCoordinator.liveNodeIDs.contains(node.id),
+                        hasSnapshot: store.nodeSnapshots[node.id] != nil,
+                        mountPolicy: liveNodeInteractionCoordinator.mountPolicy(for: node.id),
+                        hasInteractionIntent: liveNodeInteractionPredicate(node, store),
+                        keepsOverlayVisibleForHandoff: liveNodeInteractionCoordinator
+                            .isRenderedInteractive(node.id),
+                        isViewportInteracting: isViewportInteracting
+                    )
+                    if presentationState.suppressesCanvas { continue }
+                }
+
+                if let resolved = context.resolveSymbol(id: node.id) {
+                    context.draw(resolved, in: geometry.drawRect)
+                }
             }
         }
     }

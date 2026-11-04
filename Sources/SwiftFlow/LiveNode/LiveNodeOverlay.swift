@@ -68,6 +68,8 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
 
     let store: FlowStore<NodeData>
     let canvasSize: CGSize
+    let knownCandidates: Set<String>?
+    let retainedNodeIDs: Set<String>
     let nodeContent: (FlowNode<NodeData>, NodeRenderContext) -> Content
     let renderContext: (FlowNode<NodeData>) -> NodeRenderContext
     let interaction: (FlowNode<NodeData>, FlowStore<NodeData>) -> Bool
@@ -126,11 +128,18 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
                 .compactMap { $0.value == .persistent ? $0.key : nil }
         )
 
+        // Previously discovered nodes are evaluated once more after removal
+        // from the candidate set, allowing the ordinary preference reconciliation
+        // to observe their removal. Unevaluated unrelated nodes remain unknown.
+        let evaluatedCandidates = LiveNodeCandidateScope.evaluated(knownCandidates, previouslyDiscovered: coordinator.liveNodeIDs)
+        let registrarNodes = store.nodes.filter { evaluatedCandidates?.contains($0.id) ?? true }
         let visibleNodes = store.nodeIndicesFrontToBack
             .reversed()
             .compactMap { idx -> FlowNode<NodeData>? in
                 let node = store.nodes[idx]
-                if persistentNodeIDs.contains(node.id) { return node }
+                guard evaluatedCandidates?.contains(node.id) ?? true else { return nil }
+                if persistentNodeIDs.contains(node.id) || retainedNodeIDs.contains(node.id)
+                    || coordinator.isRenderedInteractive(node.id) { return node }
                 let nodeRect = CGRect(origin: node.position, size: node.size)
                     .insetBy(dx: -handleInset, dy: -handleInset)
                 return visibleCanvasRect.intersects(nodeRect) ? node : nil
@@ -168,7 +177,7 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
             // build their view tree without producing any pixels.
             // LiveNode in `.rasterize` phase renders its snapshot
             // image (or a `FlowDefaultPlaceholder`) — both cheap.
-            ForEach(store.nodes) { node in
+            ForEach(registrarNodes) { node in
                 let context = renderContext(node)
                 nodeContent(node, context)
                     .environment(\.flowNodeRenderPhase, .rasterize)
@@ -276,6 +285,15 @@ struct LiveNodeOverlay<NodeData: Sendable & Hashable, Content: View>: View {
             policies: liveNodePolicies,
             storeNodeIDs: storeNodeIDs
         )
+    }
+}
+
+/// `nil` means the generic all-node discovery path. Previously discovered
+/// nodes remain in scope for reconciliation even when no longer candidates;
+/// a missing evaluation must not be mistaken for a removal.
+enum LiveNodeCandidateScope {
+    static func evaluated(_ candidates: Set<String>?, previouslyDiscovered: Set<String>) -> Set<String>? {
+        candidates.map { $0.union(previouslyDiscovered) }
     }
 }
 
