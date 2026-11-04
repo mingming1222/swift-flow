@@ -28,6 +28,7 @@ public struct FlowCanvas<
     private var hoverExclusionRegions: [CanvasHoverRegion] = []
     private var compositedRoots: Set<String> = []
     private var compositeContentVersion: UInt64?
+    private var compositeContentVersionForMembers: ((String, [FlowNode<NodeData>]) -> UInt64)?
     private var atomicCompositeGroups = false
 
     /// Combines each requested subtree into one Canvas symbol while keeping
@@ -46,6 +47,7 @@ public struct FlowCanvas<
     public func atomicCompositedNodes(contentVersion: UInt64) -> Self {
         var copy = self
         copy.compositeContentVersion = contentVersion
+        copy.compositeContentVersionForMembers = nil
         copy.atomicCompositeGroups = true
         return copy
     }
@@ -53,6 +55,17 @@ public struct FlowCanvas<
     private var deleteActionHandler: ((FlowStore<NodeData>) -> Bool)?
     private var registeredDropTypes: [String] = []
     private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
+
+    /// A caller that can describe captured inputs per complete batch can keep
+    /// unrelated symbols stable. The callback must include every non-node
+    /// input affecting that batch, including any live callback context.
+    public func atomicCompositedNodes(contentVersionForMembers: @escaping (String, [FlowNode<NodeData>]) -> UInt64) -> Self {
+        var copy = self
+        copy.compositeContentVersion = nil
+        copy.compositeContentVersionForMembers = contentVersionForMembers
+        copy.atomicCompositeGroups = true
+        return copy
+    }
 
     /// Excludes editor controls from node hover and node cursor resolution.
     /// Pass actual visible control regions in canvas screen coordinates.
@@ -394,14 +407,19 @@ public struct FlowCanvas<
                 nodeSymbolContent(node).tag(node.id)
             }
             ForEach(compositePlan.batches) { batch in
-                if let compositeContentVersion {
+                let members = batch.members.compactMap { store.nodeLookup[$0] }
+                let localVersion = compositeContentVersionForMembers?(batch.id, members)
+                if let contentVersion = localVersion ?? compositeContentVersion {
+                    let interaction = CompositeInteractionIdentity.resolve(
+                        members: Set(batch.members), hover: store.hoveredNodeID,
+                        focus: store.focusedTarget, scoped: localVersion != nil)
                     CompositeNodeContent(
-                        nodes: batch.members.compactMap { store.nodeLookup[$0] },
+                        nodes: members,
                         contexts: batch.members.compactMap { store.nodeLookup[$0].map(nodeRenderContext) },
                         bounds: batch.bounds,
-                        contentVersion: compositeContentVersion,
-                        hoveredID: store.hoveredNodeID,
-                        focusedTarget: store.focusedTarget,
+                        contentVersion: contentVersion,
+                        hoveredID: interaction.hover,
+                        focusedTarget: interaction.focus,
                         content: nodeSymbolContent
                     )
                     .equatable()
@@ -1421,6 +1439,20 @@ private enum DragCursorKind: Equatable {
     }
 }
 #endif
+
+struct CompositeInteractionIdentity {
+    let hover: String?
+    let focus: FlowFocusTarget?
+
+    static func resolve(members: Set<String>, hover: String?, focus: FlowFocusTarget?, scoped: Bool) -> Self {
+        guard scoped else { return .init(hover: hover, focus: focus) }
+        let memberHover = hover.flatMap { members.contains($0) ? $0 : nil }
+        let memberFocus: FlowFocusTarget?
+        if case let .node(id) = focus, members.contains(id) { memberFocus = focus }
+        else { memberFocus = nil }
+        return .init(hover: memberHover, focus: memberFocus)
+    }
+}
 
 /// The local signature deliberately excludes a common world translation.
 /// Geometry is applied by drawNodes; content/style/state still invalidate pixels.

@@ -127,6 +127,23 @@ struct NodeCompositePlanTests {
         #expect(original != symbol(store.nodes, batch.bounds, version: 2))
     }
 
+    @Test func scopedSymbolInteractionOnlyChangesAffectedBatches() {
+        func value(_ id: String, hover: String?, focus: FlowFocusTarget?, scoped: Bool) -> CompositeNodeContent<String, Text> {
+            let node = FlowNode(id: id, position: .zero, data: id)
+            let interaction = CompositeInteractionIdentity.resolve(members: [id], hover: hover, focus: focus, scoped: scoped)
+            return CompositeNodeContent(nodes: [node], contexts: [.init()], bounds: .init(x: 0, y: 0, width: 160, height: 70),
+                contentVersion: 1, hoveredID: interaction.hover, focusedTarget: interaction.focus, content: { Text($0.data) })
+        }
+        for id in ["A", "B", "C"] {
+            let before = value(id, hover: "A", focus: .node("A"), scoped: true)
+            let after = value(id, hover: "B", focus: .node("B"), scoped: true)
+            #expect((before == after) == (id == "C"))
+            let legacyBefore = value(id, hover: "A", focus: .node("A"), scoped: false)
+            let legacyAfter = value(id, hover: "B", focus: .node("B"), scoped: false)
+            #expect(legacyBefore != legacyAfter)
+        }
+    }
+
     @Test func atomicHitTestingUsesTheSameBoundaryAsPainterOrderAndExpandsOnEntry() {
         let nodes = [
             FlowNode(id: "group", position: .zero, size: CGSize(width: 200, height: 100), data: "Group", zIndex: -2),
