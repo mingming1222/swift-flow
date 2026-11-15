@@ -4,6 +4,63 @@ import SwiftUI
 
 @Suite("Composite node rendering") @MainActor
 struct NodeCompositePlanTests {
+    @Test func directCompositeNeverBuildsMemberViewsAndNilFallsBack() throws {
+        let nodes = (0..<1000).map { FlowNode(id: "n\($0)", position: .zero, size: CGSize(width: 20, height: 20), data: "leaf") }
+        for direct in [true, false] {
+            var memberCalls = 0
+            var builderCalls = 0
+            let view = CompositeNodeContent(nodes: nodes, contexts: [],
+                bounds: CGRect(x: 0, y: 0, width: 20, height: 20), contentVersion: 1,
+                hoveredID: nil, focusedTarget: nil,
+                directContent: { members, _ in
+                    builderCalls += 1
+                    #expect(members.count == 1000)
+                    return direct ? AnyView(Color.red) : nil
+                }, content: { _ in memberCalls += 1; return Color.blue })
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 1
+            #expect(renderer.cgImage != nil)
+            #expect(builderCalls > 0)
+            #expect(direct ? memberCalls == 0 : memberCalls >= 1000)
+        }
+    }
+
+    @Test func viewportRejectsDistantGroupBeforeDirectOrMemberPreparation() throws {
+        var nodes: [FlowNode<String>] = []
+        for (id, x) in [("visible", CGFloat(20)), ("distant", CGFloat(100_000))] {
+            nodes.append(.init(id: id, position: CGPoint(x: x, y: 20), size: CGSize(width: 50, height: 50), data: id))
+            for index in 0..<1000 {
+                nodes.append(.init(id: "\(id)-\(index)", position: CGPoint(x: x, y: 20),
+                    size: CGSize(width: 20, height: 20), data: id, parentID: id))
+            }
+        }
+        let store = FlowStore(nodes: nodes)
+        store.atomicCompositeRootIDs = ["visible", "distant"]
+        var preparedIDs: Set<String> = []
+        var memberCalls = 0
+        let composite = store.compositeNodePlan(roots: store.atomicCompositeRootIDs, atomic: true)
+        let viewport = FlowViewportRenderPlan(nodes: nodes,
+            backToFront: Array(store.nodeIndicesFrontToBack.reversed()), composite: composite,
+            viewport: store.viewport, canvasSize: CGSize(width: 300, height: 200),
+            preloadMargin: 100, retainedIDs: [], visualBounds: { .bounded($0.frame) })
+        #expect(viewport.preparedNodeIndices.isEmpty)
+        #expect(viewport.preparedBatches.map(\.id) == ["visible"])
+        for batch in viewport.preparedBatches {
+            let view = CompositeNodeContent(nodes: batch.members.compactMap { store.nodeLookup[$0] },
+                contexts: [], bounds: batch.bounds, contentVersion: 1, hoveredID: nil, focusedTarget: nil,
+                directContent: { members, _ in
+                    preparedIDs.formUnion(members.map(\.data))
+                    return AnyView(Color.red)
+                }, content: { _ in memberCalls += 1; return Color.blue })
+            let renderer = ImageRenderer(content: view)
+            renderer.scale = 1
+            #expect(renderer.cgImage != nil)
+        }
+        #expect(preparedIDs == ["visible"], "prepared: \(preparedIDs)")
+        #expect(memberCalls == 0)
+        #expect(store.nodes.count == 2002)
+    }
+
     private func table() -> FlowStore<String> {
         var nodes = [FlowNode(id: "table", position: .zero, size: CGSize(width: 480, height: 180), data: "Table", zIndex: -2)]
         for i in 0..<20 {

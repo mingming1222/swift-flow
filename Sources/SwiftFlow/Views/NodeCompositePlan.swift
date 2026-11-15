@@ -64,12 +64,20 @@ struct NodeCompositePlan {
             guard let group = members[root], (atomic || group.count > 1), let end = lastIndex[root] else { continue }
             var crossedBounds = CGRect.null
             var safe = true
-            for node in ordered[...end] {
-                let frame = node.frame.insetBy(dx: -inset, dy: -inset)
-                if owner[node.id] == root {
-                    crossedBounds = crossedBounds.union(frame)
-                } else if !atomic && !crossedBounds.isNull && crossedBounds.intersects(frame) {
-                    safe = false; break
+            if atomic {
+                // Atomic groups deliberately own painter order. Do not scan every
+                // preceding node again for each root when no overlap test is needed.
+                for node in group {
+                    crossedBounds = crossedBounds.union(node.frame.insetBy(dx: -inset, dy: -inset))
+                }
+            } else {
+                for node in ordered[...end] {
+                    let frame = node.frame.insetBy(dx: -inset, dy: -inset)
+                    if owner[node.id] == root {
+                        crossedBounds = crossedBounds.union(frame)
+                    } else if !crossedBounds.isNull && crossedBounds.intersects(frame) {
+                        safe = false; break
+                    }
                 }
             }
             guard safe, !crossedBounds.isNull, !crossedBounds.isInfinite,

@@ -32,6 +32,7 @@ public struct FlowCanvas<
     private var compositeContentVersion: UInt64?
     private var compositeContentVersionForMembers: ((String, [FlowNode<NodeData>]) -> UInt64)?
     private var preparedCompositeIDsObserver: ((Set<String>) -> Void)?
+    private var directCompositeContent: (([FlowNode<NodeData>], CGRect) -> AnyView?)?
     private var atomicCompositeGroups = false
     private var viewportCullingConfiguration: ViewportCullingConfiguration<NodeData>?
     private var rendersEdges = true
@@ -111,6 +112,17 @@ public struct FlowCanvas<
     public func hoverExclusionRegions(_ regions: [CanvasHoverRegion]) -> Self {
         var copy = self
         copy.hoverExclusionRegions = regions
+        return copy
+    }
+
+    /// Versioned composites (atomicCompositedNodes) invoke this builder after
+    /// viewport preparation. Returning nil keeps
+    /// the standard member renderer; Store identities and interactions are unchanged.
+    public func directCompositedContent(
+        _ builder: @escaping ([FlowNode<NodeData>], CGRect) -> AnyView?
+    ) -> Self {
+        var copy = self
+        copy.directCompositeContent = builder
         return copy
     }
 
@@ -471,6 +483,7 @@ public struct FlowCanvas<
                         contentVersion: contentVersion,
                         hoveredID: interaction.hover,
                         focusedTarget: interaction.focus,
+                        directContent: directCompositeContent,
                         content: nodeSymbolContent
                     )
                     .equatable()
@@ -1525,6 +1538,7 @@ struct CompositeNodeContent<Data: Sendable & Hashable, Content: View>: View, Equ
     let contentVersion: UInt64
     let hoveredID: String?
     let focusedTarget: FlowFocusTarget?
+    var directContent: (([FlowNode<Data>], CGRect) -> AnyView?)? = nil
     let content: (FlowNode<Data>) -> Content
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1540,6 +1554,14 @@ struct CompositeNodeContent<Data: Sendable & Hashable, Content: View>: View, Equ
     }
 
     var body: some View {
+        if let direct = directContent?(nodes, bounds) {
+            direct.frame(width: bounds.width, height: bounds.height)
+        } else {
+            memberContent
+        }
+    }
+
+    private var memberContent: some View {
         ZStack(alignment: .topLeading) {
             ForEach(nodes) { node in
                 content(node)
