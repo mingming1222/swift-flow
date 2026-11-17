@@ -10,6 +10,7 @@ struct LiveNodeMountedViewSnapshotHost: View {
     let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
     let snapshotProviderReady: () -> Void
+    @Environment(\.flowPerformanceScope) private var performanceScope
 
     var body: some View {
         PlatformMountedViewSnapshotHost(
@@ -18,7 +19,8 @@ struct LiveNodeMountedViewSnapshotHost: View {
             scale: scale,
             isSurfaceVisible: isSurfaceVisible,
             registry: registry,
-            snapshotProviderReady: snapshotProviderReady
+            snapshotProviderReady: snapshotProviderReady,
+            performanceScope: performanceScope
         )
         .frame(width: size.width, height: size.height)
     }
@@ -35,6 +37,7 @@ private struct PlatformMountedViewSnapshotHost: NSViewRepresentable {
     let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
     let snapshotProviderReady: () -> Void
+    let performanceScope: UInt64
 
     func makeNSView(context: Context) -> MountedViewSnapshotNSView {
         MountedViewSnapshotNSView(
@@ -49,7 +52,8 @@ private struct PlatformMountedViewSnapshotHost: NSViewRepresentable {
             scale: scale,
             isSurfaceVisible: isSurfaceVisible,
             registry: registry,
-            snapshotProviderReady: snapshotProviderReady
+            snapshotProviderReady: snapshotProviderReady,
+            performanceScope: performanceScope
         )
     }
 
@@ -69,6 +73,7 @@ private final class MountedViewSnapshotNSView: NSView {
     private var isSurfaceVisible = false
     private var snapshotProviderReady: (() -> Void)?
     private var didNotifySnapshotProviderReady = false
+    private var performanceScope: UInt64 = 0
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
@@ -88,8 +93,10 @@ private final class MountedViewSnapshotNSView: NSView {
         scale: CGFloat,
         isSurfaceVisible: Bool,
         registry: LiveNodeSnapshotRegistry,
-        snapshotProviderReady: @escaping () -> Void
+        snapshotProviderReady: @escaping () -> Void,
+        performanceScope: UInt64
     ) {
+        self.performanceScope = performanceScope
         self.nodeID = nodeID
         snapshotSize = size
         snapshotScale = scale
@@ -125,6 +132,8 @@ private final class MountedViewSnapshotNSView: NSView {
     }
 
     private func snapshotMountedNode() async throws -> FlowNodeSnapshot {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.snapshot.mounted_capture") }
         guard isSurfaceVisible else {
             throw LiveNodeSnapshotCaptureError.surfaceNotVisible
         }
@@ -153,6 +162,7 @@ private final class MountedViewSnapshotNSView: NSView {
         guard bounds.width > 1, bounds.height > 1 else { return }
         guard !didNotifySnapshotProviderReady else { return }
         didNotifySnapshotProviderReady = true
+        FlowPerformance.count("flow.snapshot.provider.layout_ready", scope: performanceScope)
         Task { @MainActor [weak self] in
             self?.snapshotProviderReady?()
         }
@@ -179,6 +189,7 @@ private struct PlatformMountedViewSnapshotHost: UIViewRepresentable {
     let isSurfaceVisible: Bool
     let registry: LiveNodeSnapshotRegistry
     let snapshotProviderReady: () -> Void
+    let performanceScope: UInt64
 
     func makeUIView(context: Context) -> MountedViewSnapshotUIView {
         MountedViewSnapshotUIView()
@@ -191,7 +202,8 @@ private struct PlatformMountedViewSnapshotHost: UIViewRepresentable {
             scale: scale,
             isSurfaceVisible: isSurfaceVisible,
             registry: registry,
-            snapshotProviderReady: snapshotProviderReady
+            snapshotProviderReady: snapshotProviderReady,
+            performanceScope: performanceScope
         )
     }
 
@@ -210,6 +222,7 @@ private final class MountedViewSnapshotUIView: UIView {
     private var isSurfaceVisible = false
     private var snapshotProviderReady: (() -> Void)?
     private var didNotifySnapshotProviderReady = false
+    private var performanceScope: UInt64 = 0
 
     init() {
         super.init(frame: .zero)
@@ -228,8 +241,10 @@ private final class MountedViewSnapshotUIView: UIView {
         scale: CGFloat,
         isSurfaceVisible: Bool,
         registry: LiveNodeSnapshotRegistry,
-        snapshotProviderReady: @escaping () -> Void
+        snapshotProviderReady: @escaping () -> Void,
+        performanceScope: UInt64
     ) {
+        self.performanceScope = performanceScope
         self.nodeID = nodeID
         snapshotSize = size
         snapshotScale = scale
@@ -265,6 +280,8 @@ private final class MountedViewSnapshotUIView: UIView {
     }
 
     private func snapshotMountedNode() throws -> FlowNodeSnapshot {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.snapshot.mounted_capture") }
         guard isSurfaceVisible else {
             throw LiveNodeSnapshotCaptureError.surfaceNotVisible
         }
@@ -363,6 +380,7 @@ private final class MountedViewSnapshotUIView: UIView {
         guard bounds.width > 1, bounds.height > 1 else { return }
         guard !didNotifySnapshotProviderReady else { return }
         didNotifySnapshotProviderReady = true
+        FlowPerformance.count("flow.snapshot.provider.layout_ready", scope: performanceScope)
         Task { @MainActor [weak self] in
             self?.snapshotProviderReady?()
         }

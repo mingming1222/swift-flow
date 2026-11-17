@@ -196,6 +196,26 @@ final class LiveNodeSnapshotRegistry {
         mountedViewHandler != nil
     }
 
+    /// Provider completion is distinct from a store accepting its generation.
+    func capture(
+        using handler: @MainActor () async -> FlowNodeSnapshot?,
+        performanceScope: UInt64
+    ) async -> FlowNodeSnapshot? {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        timing?.count("flow.snapshot.capture.request")
+        defer { timing?.end("flow.snapshot.capture.provider") }
+        let snapshot = await handler()
+        if Task.isCancelled {
+            timing?.count("flow.snapshot.capture.cancelled")
+        } else if let snapshot {
+            timing?.count("flow.snapshot.capture.completed")
+            timing?.count("flow.snapshot.capture.pixels", snapshot.cgImage.width * snapshot.cgImage.height)
+        } else {
+            timing?.count("flow.snapshot.capture.failed")
+        }
+        return snapshot
+    }
+
 }
 
 // MARK: - Core
@@ -215,6 +235,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     @Environment(\.liveNodeInteractionCoordinator) private var coordinator
     @Environment(\.defersLiveNodeSnapshotWrites) private var defersSnapshotWrites
     @Environment(\.isLiveNodeSurfaceVisible) private var isLiveNodeSurfaceVisible
+    @Environment(\.flowPerformanceScope) private var performanceScope
 
     @State private var snapshotRegistry = LiveNodeSnapshotRegistry()
     @State private var isSeedingInitialSnapshot: Bool = false
@@ -308,6 +329,12 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         guard isLiveNodeSurfaceVisible else { return }
         guard snapshotRegistry.hasMountedViewSnapshotProvider else { return }
         guard snapshotWriter != nil else { return }
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        timing?.count("flow.snapshot.initial_request")
+        defer {
+            timing?.end("flow.snapshot.initial_request")
+            if Task.isCancelled { timing?.count("flow.snapshot.initial_request.cancelled") }
+        }
 
         tracePoster("initialCapture start")
         isSeedingInitialSnapshot = true
@@ -335,6 +362,11 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
     @MainActor
     @discardableResult
     private func refreshSnapshot(reason: String) async -> Bool {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer {
+            timing?.end("flow.snapshot.refresh_request")
+            if Task.isCancelled { timing?.count("flow.snapshot.request.cancelled") }
+        }
         guard snapshotWriter != nil else { return false }
         guard !Task.isCancelled else {
             return false
@@ -358,9 +390,11 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 requiredScale: snapshotScale
             )
         } catch let error as LiveNodeSnapshotCaptureError {
+            timing?.count("flow.snapshot.quality.failed")
             if case .insufficientResolution = error,
                environment.snapshot != nil {
                 tracePoster("\(reason) retainedExistingPoster \(error)")
+                timing?.count("flow.snapshot.quality.retained_existing")
                 return true
             }
             let failure = LiveNodeSnapshotFailure(
@@ -371,6 +405,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             tracePoster("\(reason) failed \(failure)")
             return false
         } catch {
+            timing?.count("flow.snapshot.quality.failed")
             let failure = LiveNodeSnapshotFailure(
                 nodeID: environment.id,
                 stage: .normalization,
@@ -391,9 +426,10 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
         guard let handler = snapshotRegistry.preferredSnapshotProvider(
             allowsMountedView: isLiveNodeSurfaceVisible
         ) else {
+            FlowPerformance.count("flow.snapshot.capture.no_provider", scope: performanceScope)
             return nil
         }
-        return await handler()
+        return await snapshotRegistry.capture(using: handler, performanceScope: performanceScope)
     }
 
     private var snapshotScale: CGFloat {
@@ -412,6 +448,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
             snapshotWriter(environment.id, normalized)
             return true
         } catch {
+            FlowPerformance.count("flow.snapshot.normalize.failed", scope: performanceScope)
             let failure = LiveNodeSnapshotFailure(
                 nodeID: environment.id,
                 stage: .normalization,
@@ -442,6 +479,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                     )
                     snapshotWriter(nodeID, normalized)
                 } catch {
+                    FlowPerformance.count("flow.snapshot.normalize.failed", scope: performanceScope)
                     let failure = LiveNodeSnapshotFailure(
                         nodeID: nodeID,
                         stage: .normalization,
@@ -462,10 +500,17 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                 allowsImmediateSnapshotWrites
             },
             requestPosterUpdate: {
+                let timing = FlowPerformance.begin(scope: performanceScope)
+                timing?.count("flow.snapshot.explicit_request")
+                defer {
+                    timing?.end("flow.snapshot.explicit_request")
+                    if Task.isCancelled { timing?.count("flow.snapshot.request.cancelled") }
+                }
                 print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest start")
                 guard let handler = registry.preferredSnapshotProvider(
                     allowsMountedView: allowsMountedViewSnapshot
                 ) else {
+                    timing?.count("flow.snapshot.capture.no_provider")
                     let reason = registry.hasMountedViewSnapshotProvider
                         ? "surfaceNotVisible"
                         : "noProvider"
@@ -479,7 +524,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                     print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest cancelledBeforeStableFrame")
                     return
                 }
-                guard let snapshot = await handler() else {
+                guard let snapshot = await registry.capture(using: handler, performanceScope: performanceScope) else {
                     print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest noSnapshot")
                     return
                 }
@@ -495,6 +540,7 @@ private struct LiveNodeCore<Content: View, Placeholder: View>: View {
                     snapshotWriter(nodeID, normalized)
                     print("[SwiftFlow][LiveNodePoster] node=\(nodeID) event=explicitRequest wrote")
                 } catch {
+                    timing?.count("flow.snapshot.normalize.failed")
                     let failure = LiveNodeSnapshotFailure(
                         nodeID: nodeID,
                         stage: .normalization,
@@ -540,8 +586,13 @@ private struct InitialSnapshotSeedTrigger: Hashable {
 private struct RasterizedNodeBody<Placeholder: View>: View {
     let snapshot: FlowNodeSnapshot?
     let placeholder: () -> Placeholder
+    @Environment(\.flowPerformanceScope) private var performanceScope
 
     var body: some View {
+        let _ = FlowPerformance.count(
+            snapshot == nil ? "flow.snapshot.cache.miss" : "flow.snapshot.cache.hit",
+            scope: performanceScope
+        )
         Group {
             if let snapshot {
                 SnapshotImage(snapshot: snapshot)

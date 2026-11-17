@@ -44,6 +44,27 @@ struct ContentView: View {
 
 This renders two nodes connected by a bezier edge. Nodes are draggable, the canvas supports pan and zoom out of the box.
 
+## Optional performance samples
+
+`FlowPerformance.configure(sink:)` installs a synchronous `@Sendable` callback;
+pass `nil` (the default) to disable it. Bind each store's `performanceScope` to a
+transient consumer scope before rendering. Samples expose a static `name`,
+`kind` (`duration` or `counter`), `nanoseconds`, `count`, and `scope`. Aggregate
+high-frequency samples in the consumer; callbacks must not block rendering.
+No identifiers, content, URLs, or paths are included.
+
+`flow.viewport.*` measures input callbacks and immediate viewport application.
+`flow.render.*` separates preparation, composite cache, viewport plan, symbol
+resolution attempts/successes, and draw callback return. `flow.snapshot.*`
+separates rasterized-body cache reads, invalidation requests/actual removals,
+provider requests/completion/failure/cancellation, normalization failure, and
+accepted/missing-node/stale-generation writes. Async request durations include
+the existing stabilization wait; provider and mounted-capture durations do not.
+`provider.layout_ready` means a mounted surface has a window and nonzero bounds,
+not that its media is loaded. Neither readiness nor draw callback return proves
+GPU completion or screen presentation. No timer, output, clock read, or extra
+document traversal is created while disabled.
+
 ## Core Concepts
 
 ### FlowStore

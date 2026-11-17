@@ -22,6 +22,9 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public var atomicCompositeRootIDs: Set<String> = []
     public var configuration: FlowConfiguration
 
+    /// Transient consumer correlation only; never persisted or observed by rendering.
+    @ObservationIgnored public var performanceScope: UInt64 = 0
+
     /// Rasterized snapshots keyed by node id, used by the Canvas rasterize
     /// path when a node is currently inactive. Written by `LiveNode` (for
     /// SwiftUI content) or by the app (for `.manual` captures of native
@@ -107,7 +110,10 @@ public final class FlowStore<Data: Sendable & Hashable> {
 
     /// Viewport changes do not rebuild subtree ownership or painter-order checks.
     func compositeNodePlan(roots: Set<String>, atomic: Bool = false) -> NodeCompositePlan {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.render.composite_plan") }
         guard !roots.isEmpty else {
+            timing?.count("flow.render.composite.empty")
             return NodeCompositePlan(nodes: nodes, backToFront: [], roots: [], inset: 0)
         }
         let inputs = nodes.map { NodeCompositePlanCache.Input(
@@ -115,10 +121,14 @@ public final class FlowStore<Data: Sendable & Hashable> {
         ) }
         if nodeCompositePlanCache.inputs == inputs, nodeCompositePlanCache.roots == roots,
            nodeCompositePlanCache.atomic == atomic, let plan = nodeCompositePlanCache.plan {
+            timing?.count("flow.render.composite.cache_hit")
             return atomic ? plan.positioned(in: nodeLookup, inset: FlowHandle.diameter / 2) : plan
         }
+        timing?.count("flow.render.composite.cache_miss")
         let plan = NodeCompositePlan(nodes: nodes, backToFront: Array(nodeIndicesFrontToBack.reversed()),
                                      roots: roots, inset: FlowHandle.diameter / 2, atomic: atomic)
+        timing?.count("flow.render.composite.batches", plan.batches.count)
+        timing?.count("flow.render.composite.members", plan.memberIDs.count)
         nodeCompositePlanCache = NodeCompositePlanCache(atomic: atomic, inputs: inputs, roots: roots, plan: plan)
         return plan
     }
@@ -263,7 +273,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
 
         for removedNodeID in nodeIDsToRemove {
             nodePositionAnimations.removeValue(forKey: removedNodeID)
-            nodeSnapshots.removeValue(forKey: removedNodeID)
+            clearNodeSnapshot(for: removedNodeID)
         }
 
         nodes.removeAll { nodeIDsToRemove.contains($0.id) }
@@ -349,7 +359,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         let oldEdgeParentIDs = Dictionary(uniqueKeysWithValues: childEdgeIDs.map { ($0, Optional(nodeID)) })
 
         nodePositionAnimations.removeValue(forKey: nodeID)
-        nodeSnapshots.removeValue(forKey: nodeID)
+        clearNodeSnapshot(for: nodeID)
 
         nodes.removeAll { $0.id == nodeID }
         nodeLookup.removeValue(forKey: nodeID)
@@ -444,7 +454,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
             rebuildSortedNodes()
         }
         if nodes[index].size != oldSize {
-            nodeSnapshots.removeValue(forKey: nodeID)
+            clearNodeSnapshot(for: nodeID)
         }
         emitNodeChange(.replace(nodes[index]))
     }
@@ -455,7 +465,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
         nodes[index].size = size
         nodeLookup[nodeID] = nodes[index]
         if size != oldSize {
-            nodeSnapshots.removeValue(forKey: nodeID)
+            clearNodeSnapshot(for: nodeID)
         }
         emitNodeChange(.dimensions(nodeID: nodeID, size: size))
     }
@@ -465,8 +475,13 @@ public final class FlowStore<Data: Sendable & Hashable> {
     /// Store a rasterized snapshot for a node. Overwrites any prior entry.
     /// Not registered with undo — snapshots are a rendering cache.
     public func setNodeSnapshot(_ snapshot: FlowNodeSnapshot, for nodeID: String) {
-        guard nodeLookup[nodeID] != nil else { return }
+        guard nodeLookup[nodeID] != nil else {
+            FlowPerformance.count("flow.snapshot.write.missing_node", scope: performanceScope)
+            return
+        }
         nodeSnapshots[nodeID] = snapshot
+        FlowPerformance.count("flow.snapshot.write.accepted", scope: performanceScope)
+        FlowPerformance.count("flow.snapshot.write.pixels", snapshot.cgImage.width * snapshot.cgImage.height, scope: performanceScope)
     }
 
     /// Current document-generation token for async snapshot writes.
@@ -480,17 +495,24 @@ public final class FlowStore<Data: Sendable & Hashable> {
         for nodeID: String,
         generation: Int
     ) {
-        guard generation == snapshotGeneration else { return }
+        guard generation == snapshotGeneration else {
+            FlowPerformance.count("flow.snapshot.write.stale", scope: performanceScope)
+            return
+        }
         setNodeSnapshot(snapshot, for: nodeID)
     }
 
     /// Drop the cached snapshot for a single node.
     public func clearNodeSnapshot(for nodeID: String) {
-        nodeSnapshots.removeValue(forKey: nodeID)
+        let removed = nodeSnapshots.removeValue(forKey: nodeID)
+        FlowPerformance.count("flow.snapshot.invalidate.request", scope: performanceScope)
+        FlowPerformance.count("flow.snapshot.invalidate.removed", removed == nil ? 0 : 1, scope: performanceScope)
     }
 
     /// Drop every cached snapshot. Useful when bulk-reloading a document.
     public func clearAllNodeSnapshots() {
+        FlowPerformance.count("flow.snapshot.invalidate.all", scope: performanceScope)
+        FlowPerformance.count("flow.snapshot.invalidate.removed", nodeSnapshots.count, scope: performanceScope)
         snapshotGeneration += 1
         nodeSnapshots.removeAll(keepingCapacity: false)
     }
@@ -1227,24 +1249,40 @@ public final class FlowStore<Data: Sendable & Hashable> {
     // MARK: - Viewport
 
     public func pan(by delta: CGSize) {
-        guard configuration.panEnabled else { return }
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.viewport.pan.apply") }
+        guard configuration.panEnabled else {
+            timing?.count("flow.viewport.pan.disabled")
+            return
+        }
         viewportAnimations.x = nil
         viewportAnimations.y = nil
         zoomAnchorState = nil
         viewport.offset.x += delta.width
         viewport.offset.y += delta.height
+        timing?.count("flow.viewport.pan.changed", delta == .zero ? 0 : 1)
     }
 
     public func zoom(by factor: CGFloat, anchor: CGPoint) {
-        guard configuration.zoomEnabled else { return }
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.viewport.zoom.apply") }
+        guard configuration.zoomEnabled else {
+            timing?.count("flow.viewport.zoom.disabled")
+            return
+        }
         viewportAnimations = (nil, nil, nil)
         zoomAnchorState = nil
         let oldZoom = viewport.zoom
-        guard oldZoom > 0 else { return }
+        guard oldZoom > 0 else {
+            timing?.count("flow.viewport.zoom.invalid")
+            return
+        }
         let newZoom = max(
             configuration.minZoom,
             min(configuration.maxZoom, oldZoom * factor)
         )
+        timing?.count("flow.viewport.zoom.clamped", newZoom == oldZoom * factor ? 0 : 1)
+        timing?.count("flow.viewport.zoom.changed", newZoom == oldZoom ? 0 : 1)
         viewport.zoom = newZoom
         let scale = newZoom / oldZoom
         viewport.offset.x = anchor.x - (anchor.x - viewport.offset.x) * scale
@@ -2090,6 +2128,8 @@ extension FlowStore where Data: Codable {
         // documents would briefly show the previous bitmap), the drag
         // session refers to nodes that are about to disappear, and any
         // pending interactive-update batch belongs to the old document.
+        FlowPerformance.count("flow.snapshot.invalidate.load", scope: performanceScope)
+        FlowPerformance.count("flow.snapshot.invalidate.removed", nodeSnapshots.count, scope: performanceScope)
         snapshotGeneration += 1
         nodeSnapshots.removeAll()
         edgeGeometryCache.removeAll()

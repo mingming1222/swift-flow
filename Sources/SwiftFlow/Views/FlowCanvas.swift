@@ -426,10 +426,12 @@ public struct FlowCanvas<
         GeometryReader { geometry in
             canvasBody(in: geometry.size)
         }
+        .environment(\.flowPerformanceScope, store.performanceScope)
     }
 
     @ViewBuilder
     private func canvasBody(in size: CGSize) -> some View {
+        let preparationTiming = FlowPerformance.begin(scope: store.performanceScope)
         let liveIDs: Set<String> = isLiveNodeOverlayEnabled
             ? liveNodeInteractionCoordinator.liveNodeIDs.union(store.nodes.compactMap {
                 (knownLiveNodeCandidates?.contains($0.id) ?? true) && liveNodeInteractionPredicate($0, store) ? $0.id : nil
@@ -441,13 +443,19 @@ public struct FlowCanvas<
             FlowViewportRenderPlan(nodes: store.nodes, backToFront: Array(store.nodeIndicesFrontToBack.reversed()),
                 composite: compositePlan, viewport: store.viewport, canvasSize: size,
                 preloadMargin: configuration.preloadMargin, retainedIDs: configuration.retainedNodeIDs,
-                visualBounds: configuration.visualBounds)
+                visualBounds: configuration.visualBounds, performanceScope: store.performanceScope)
         }
         let preparedNodes = viewportPlan.map { $0.preparedNodeIndices.map { store.nodes[$0] } }
             ?? store.nodes.filter { !compositePlan.memberIDs.contains($0.id) }
         let preparedBatches = viewportPlan?.preparedBatches ?? compositePlan.batches
         let _ = preparedCompositeIDsObserver?(Set(preparedBatches.map(\.id)))
+        let _ = preparationTiming?.count("flow.render.prepared_nodes", preparedNodes.count)
+        let _ = preparationTiming?.count("flow.render.prepared_batches", preparedBatches.count)
+        let _ = preparationTiming?.count("flow.render.live_nodes", liveIDs.count)
+        let _ = preparationTiming?.end("flow.render.prepare")
         let canvasView = Canvas(opaque: false, colorMode: .nonLinear, rendersAsynchronously: false) { context, canvasSize in
+            let timing = FlowPerformance.begin(scope: store.performanceScope)
+            defer { timing?.end("flow.render.draw_callback") }
             let selectionContext = SelectionContextResolver.resolve(
                 store: store,
                 canvasSize: canvasSize
@@ -562,8 +570,11 @@ public struct FlowCanvas<
         #if os(macOS)
         let hostView = CanvasHostView(
             onScroll: { delta, location in
+                let timing = FlowPerformance.begin(scope: store.performanceScope)
+                defer { timing?.end("flow.viewport.input.scroll") }
                 let wasViewportInteracting = isViewportInteracting
                 guard store.configuration.panEnabled else {
+                    timing?.count("flow.viewport.input.scroll.disabled")
                     logCanvasScrollIgnored(delta: delta, location: location, canvasSize: size, reason: "panDisabled")
                     return
                 }
@@ -575,6 +586,8 @@ public struct FlowCanvas<
                 scheduleEndViewportInteraction()
             },
             onMagnify: { magnification, location in
+                let timing = FlowPerformance.begin(scope: store.performanceScope)
+                defer { timing?.end("flow.viewport.input.magnify.host") }
                 beginViewportInteraction()
                 store.zoom(by: 1 + magnification, anchor: location)
                 scheduleEndViewportInteraction()
@@ -644,6 +657,8 @@ public struct FlowCanvas<
                     cursor(at: location)
                 },
                 onMagnify: { magnification, location in
+                    let timing = FlowPerformance.begin(scope: store.performanceScope)
+                    defer { timing?.end("flow.viewport.input.magnify.hover") }
                     beginViewportInteraction()
                     store.zoom(by: 1 + magnification, anchor: location)
                     scheduleEndViewportInteraction()
@@ -660,6 +675,8 @@ public struct FlowCanvas<
         #else
         let hostView = CanvasHostView(
             onPan: { delta in
+                let timing = FlowPerformance.begin(scope: store.performanceScope)
+                defer { timing?.end("flow.viewport.input.pan") }
                 guard store.configuration.panEnabled else { return }
                 beginViewportInteraction()
                 store.pan(by: delta)
@@ -959,6 +976,16 @@ public struct FlowCanvas<
 
     private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize, compositePlan: NodeCompositePlan,
                            viewportPlan: FlowViewportRenderPlan?) {
+        let timing = FlowPerformance.begin(scope: store.performanceScope)
+        var attempted = 0
+        var resolvedCount = 0
+        var suppressed = 0
+        defer {
+            timing?.count("flow.render.symbol.attempted", attempted)
+            timing?.count("flow.render.symbol.resolved", resolvedCount)
+            timing?.count("flow.render.node.suppressed", suppressed)
+            timing?.end("flow.render.draw_nodes")
+        }
         let viewport = store.viewport
         let margin: CGFloat = 100
 
@@ -983,7 +1010,9 @@ public struct FlowCanvas<
                 let rect = CGRect(origin: viewport.canvasToScreen(bounds.origin),
                                   size: CGSize(width: bounds.width * viewport.zoom, height: bounds.height * viewport.zoom))
                 if viewportPlan != nil || CGRect(origin: .zero, size: canvasSize).insetBy(dx: -margin, dy: -margin).intersects(rect) {
+                    if timing != nil { attempted += 1 }
                     if let symbol = context.resolveSymbol(id: CompositeNodeSymbolID(rootID: batch.id)) {
+                        if timing != nil { resolvedCount += 1 }
                         context.draw(symbol, in: rect)
                     }
                 }
@@ -1011,10 +1040,15 @@ public struct FlowCanvas<
                             .isRenderedInteractive(node.id),
                         isViewportInteracting: isViewportInteracting
                     )
-                    if presentationState.suppressesCanvas { continue }
+                    if presentationState.suppressesCanvas {
+                        if timing != nil { suppressed += 1 }
+                        continue
+                    }
                 }
 
+                if timing != nil { attempted += 1 }
                 if let resolved = context.resolveSymbol(id: node.id) {
+                    if timing != nil { resolvedCount += 1 }
                     context.draw(resolved, in: geometry.drawRect)
                 }
             }
@@ -1163,6 +1197,8 @@ public struct FlowCanvas<
     private var magnifyGesture: some Gesture {
         MagnifyGesture()
             .onChanged { value in
+                let timing = FlowPerformance.begin(scope: store.performanceScope)
+                defer { timing?.end("flow.viewport.input.magnify.gesture") }
                 guard store.configuration.zoomEnabled else { return }
                 beginViewportInteraction()
                 let factor = value.magnification / lastMagnification

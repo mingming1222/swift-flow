@@ -26,7 +26,9 @@ struct FlowViewportRenderPlan {
     init<Data: Sendable & Hashable>(nodes: [FlowNode<Data>], backToFront: [Int],
          composite: NodeCompositePlan, viewport: Viewport, canvasSize: CGSize,
          preloadMargin: CGFloat, retainedIDs: Set<String>,
-         visualBounds: (FlowNode<Data>) -> FlowVisualBounds) {
+         visualBounds: (FlowNode<Data>) -> FlowVisualBounds, performanceScope: UInt64 = 0) {
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.render.viewport_plan") }
         let valid = canvasSize.width.isFinite && canvasSize.height.isFinite && canvasSize.width > 0 && canvasSize.height > 0
             && viewport.zoom.isFinite && viewport.zoom >= 0.01 && viewport.offset.x.isFinite && viewport.offset.y.isFinite
             && preloadMargin.isFinite && preloadMargin >= 0
@@ -84,5 +86,11 @@ struct FlowViewportRenderPlan {
         self.preparedBatches = batches
         self.drawUnits = draw
         self.unknownUnitCount = unknownCount
+        timing?.count("flow.render.viewport.scanned", backToFront.count)
+        timing?.count("flow.render.viewport.prepared_nodes", preparedNodes.count)
+        timing?.count("flow.render.viewport.prepared_batches", batches.count)
+        timing?.count("flow.render.viewport.draw_units", draw.count)
+        timing?.count("flow.render.viewport.unknown_units", unknownCount)
+        timing?.count("flow.render.viewport.invalid", valid ? 0 : 1)
     }
 }
