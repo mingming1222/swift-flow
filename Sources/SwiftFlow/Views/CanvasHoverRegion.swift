@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 /// A screen-space editor surface that owns pointer feedback above the canvas.
@@ -15,5 +16,23 @@ public struct CanvasHoverRegion: Equatable, Sendable {
         guard !frame.isEmpty, frame.contains(point) else { return false }
         return RoundedRectangle(cornerRadius: max(0, cornerRadius))
             .path(in: frame).contains(point)
+    }
+}
+
+/// Live input geometry. Pass the source itself through the drawing hierarchy;
+/// only pointer handlers and the hover tracker should read its regions.
+@MainActor @Observable
+public final class CanvasHoverRegionSource {
+    public private(set) var regions: [CanvasHoverRegion] = []
+
+    public init() {}
+
+    public func update(_ regions: [CanvasHoverRegion]) {
+        guard self.regions != regions else { return }
+        self.regions = regions
+    }
+
+    public func contains(_ point: CGPoint) -> Bool {
+        regions.contains { $0.contains(point) }
     }
 }

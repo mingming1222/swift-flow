@@ -28,14 +28,16 @@ struct CanvasHoverRegionTests {
             frame: CGRect(x: point.x - 18, y: point.y - 18, width: 36, height: 36),
             cornerRadius: 18
         )
-        let canvas = FlowCanvas(store: store)
-        #expect(canvas.cursor(at: point) === NSCursor.openHand)
-        let coveredCanvas = canvas.hoverExclusionRegions([control])
+        let regions = CanvasHoverRegionSource()
+        let coveredCanvas = FlowCanvas(store: store).hoverExclusionRegions(regions)
+        #expect(coveredCanvas.cursor(at: point) === NSCursor.openHand)
+        regions.update([control])
         #expect(coveredCanvas.cursor(at: point) === NSCursor.arrow)
         // The transparent circle corner still belongs to the underlying node.
         let corner = CGPoint(x: control.frame.minX + 1, y: control.frame.minY + 1)
         #expect(coveredCanvas.cursor(at: corner) === NSCursor.openHand)
-        #expect(coveredCanvas.hoverExclusionRegions([]).cursor(at: point) === NSCursor.openHand)
+        regions.update([])
+        #expect(coveredCanvas.cursor(at: point) === NSCursor.openHand)
     }
 
     @Test("Entering a control clears node hover without asking for a node cursor; leaving restores it")

@@ -2,7 +2,24 @@
 
 import SwiftUI
 
-struct CanvasHoverTrackingView: NSViewRepresentable {
+struct CanvasHoverTrackingView: View {
+    let exclusionSource: CanvasHoverRegionSource?
+    let onHover: @MainActor (CGPoint) -> Void
+    let onExit: @MainActor () -> Void
+    let cursorAt: @MainActor (CGPoint) -> NSCursor
+    let onMagnify: @MainActor (CGFloat, CGPoint) -> Void
+    let shouldHandleViewportMagnify: @MainActor (CGPoint) -> Bool
+
+    var body: some View {
+        CanvasHoverTrackingSurface(
+            exclusionRegions: exclusionSource?.regions ?? [],
+            onHover: onHover, onExit: onExit, cursorAt: cursorAt,
+            onMagnify: onMagnify, shouldHandleViewportMagnify: shouldHandleViewportMagnify
+        )
+    }
+}
+
+private struct CanvasHoverTrackingSurface: NSViewRepresentable {
 
     let exclusionRegions: [CanvasHoverRegion]
     let onHover: @MainActor (CGPoint) -> Void

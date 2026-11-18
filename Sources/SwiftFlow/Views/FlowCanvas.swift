@@ -27,7 +27,7 @@ public struct FlowCanvas<
     private var liveNodeInteractionPredicate: (FlowNode<NodeData>, FlowStore<NodeData>) -> Bool = { node, store in
         store.hoveredNodeID == node.id
     }
-    private var hoverExclusionRegions: [CanvasHoverRegion] = []
+    private var hoverExclusionSource: CanvasHoverRegionSource?
     private var compositedRoots: Set<String> = []
     private var compositeContentVersion: UInt64?
     private var compositeContentVersionForMembers: ((String, [FlowNode<NodeData>]) -> UInt64)?
@@ -109,11 +109,11 @@ public struct FlowCanvas<
     private var registeredDropTypes: [String] = []
     private var dropHandler: (@MainActor @Sendable (_ event: CanvasDropEvent) -> Bool)? = nil
 
-    /// Excludes editor controls from node hover and node cursor resolution.
-    /// Pass actual visible control regions in canvas screen coordinates.
-    public func hoverExclusionRegions(_ regions: [CanvasHoverRegion]) -> Self {
+    /// Excludes visible editor controls from hover and cursor resolution.
+    /// Moving controls update the source without invalidating Canvas paint.
+    public func hoverExclusionRegions(_ source: CanvasHoverRegionSource?) -> Self {
         var copy = self
-        copy.hoverExclusionRegions = regions
+        copy.hoverExclusionSource = source
         return copy
     }
 
@@ -663,7 +663,7 @@ public struct FlowCanvas<
                 builders: selectionAccessoryBuilders
             )
             CanvasHoverTrackingView(
-                exclusionRegions: hoverExclusionRegions,
+                exclusionSource: hoverExclusionSource,
                 onHover: { location in
                     updateHover(at: location, source: "canvas.hoverTracking")
                 },
@@ -708,7 +708,7 @@ public struct FlowCanvas<
             switch phase {
             case .active(let location):
                 let canvasPoint = store.viewport.screenToCanvas(location)
-                let nodeID = hoverExclusionRegions.contains(where: { $0.contains(location) })
+                let nodeID = hoverExclusionSource?.contains(location) == true
                     ? nil : store.hitTestNode(at: canvasPoint)
                 store.setHoveredNode(nodeID, source: "canvas.hover.active")
             case .ended:
@@ -1428,7 +1428,7 @@ public struct FlowCanvas<
     }
 
     private func updateHover(at location: CGPoint, source: String) {
-        guard !hoverExclusionRegions.contains(where: { $0.contains(location) }) else {
+        guard hoverExclusionSource?.contains(location) != true else {
             store.setHoveredNode(nil, source: source)
             return
         }
@@ -1440,7 +1440,7 @@ public struct FlowCanvas<
     // Both CanvasHostView and CanvasHoverTrackingView resolve cursors here.
     // Filtering only the hover tracker lets the host overwrite control cursors.
     func cursor(at location: CGPoint) -> NSCursor {
-        guard !hoverExclusionRegions.contains(where: { $0.contains(location) }) else {
+        guard hoverExclusionSource?.contains(location) != true else {
             return .arrow
         }
         switch dragMode {
