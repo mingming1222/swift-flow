@@ -215,6 +215,13 @@ final class LiveNodeInteractionCoordinator {
         posterProviders.removeValue(forKey: nodeID)
     }
 
+    /// Retain the symbol while a discovered node has any live or snapshot
+    /// handoff state, even if it leaves the caller's current candidate set.
+    func hasLiveDrawingState(for nodeID: String) -> Bool {
+        liveNodeIDs.contains(nodeID) || liveNodeMountPolicies[nodeID] != nil
+            || renderedInteractive.contains(nodeID) || posterProviders[nodeID] != nil
+    }
+
     // MARK: - Intent → render-state transitions
 
     /// Applies intent for a node. Safe to call every body evaluation — the

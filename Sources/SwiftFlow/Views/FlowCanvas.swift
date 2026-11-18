@@ -33,6 +33,8 @@ public struct FlowCanvas<
     private var compositeContentVersionForMembers: ((String, [FlowNode<NodeData>]) -> UInt64)?
     private var preparedCompositeIDsObserver: ((Set<String>) -> Void)?
     private var directCompositeContent: (([FlowNode<NodeData>], CGRect) -> AnyView?)?
+    private typealias NodeDrawer = (inout GraphicsContext) -> Void
+    private var prepareDirectNodeDrawing: ((FlowNode<NodeData>) -> NodeDrawer?)?
     private var atomicCompositeGroups = false
     private var viewportCullingConfiguration: ViewportCullingConfiguration<NodeData>?
     private var rendersEdges = true
@@ -123,6 +125,22 @@ public struct FlowCanvas<
     ) -> Self {
         var copy = self
         copy.directCompositeContent = builder
+        return copy
+    }
+
+    /// Prepares direct drawing for standalone nodes selected by `viewportCulling`.
+    /// Returning nil keeps the normal node symbol, as do live candidates,
+    /// nodes with snapshots, and nodes in composite batches. With live-node
+    /// support enabled, supply a complete `liveNodeCandidates` set to opt in.
+    ///
+    /// Each draw runs in node painter order with a local origin at the node
+    /// frame's top-left and units in logical canvas points, without handle inset.
+    /// This replaces the node's symbol visuals only; Store interactions remain.
+    public func directNodeDrawing(
+        _ prepare: @escaping (FlowNode<NodeData>) -> ((inout GraphicsContext) -> Void)?
+    ) -> Self {
+        var copy = self
+        copy.prepareDirectNodeDrawing = prepare
         return copy
     }
 
@@ -445,11 +463,10 @@ public struct FlowCanvas<
                 preloadMargin: configuration.preloadMargin, retainedIDs: configuration.retainedNodeIDs,
                 visualBounds: configuration.visualBounds, performanceScope: store.performanceScope)
         }
-        let preparedNodes = viewportPlan.map { $0.preparedNodeIndices.map { store.nodes[$0] } }
-            ?? store.nodes.filter { !compositePlan.memberIDs.contains($0.id) }
+        let standalone = prepareStandaloneNodes(viewportPlan: viewportPlan, compositePlan: compositePlan)
         let preparedBatches = viewportPlan?.preparedBatches ?? compositePlan.batches
         let _ = preparedCompositeIDsObserver?(Set(preparedBatches.map(\.id)))
-        let _ = preparationTiming?.count("flow.render.prepared_nodes", preparedNodes.count)
+        let _ = preparationTiming?.count("flow.render.prepared_nodes", standalone.symbols.count + standalone.direct.count)
         let _ = preparationTiming?.count("flow.render.prepared_batches", preparedBatches.count)
         let _ = preparationTiming?.count("flow.render.live_nodes", liveIDs.count)
         let _ = preparationTiming?.end("flow.render.prepare")
@@ -470,11 +487,12 @@ public struct FlowCanvas<
                 }
             }
             drawConnectionDraft(context: &context, canvasSize: canvasSize)
-            drawNodes(context: &context, canvasSize: canvasSize, compositePlan: compositePlan, viewportPlan: viewportPlan)
+            drawNodes(context: &context, canvasSize: canvasSize, compositePlan: compositePlan,
+                      viewportPlan: viewportPlan, directNodeDrawers: standalone.direct)
             drawSelectionDecorations(layer: .overlay, context: &context, selection: selectionContext)
             drawSelectionRect(context: &context)
         } symbols: {
-            ForEach(preparedNodes) { node in
+            ForEach(standalone.symbols) { node in
                 nodeSymbolContent(node).tag(node.id)
             }
             ForEach(preparedBatches) { batch in
@@ -974,16 +992,49 @@ public struct FlowCanvas<
 
     // MARK: - Drawing: Nodes
 
+    private func prepareStandaloneNodes(
+        viewportPlan: FlowViewportRenderPlan?, compositePlan: NodeCompositePlan
+    ) -> (symbols: [FlowNode<NodeData>], direct: [String: NodeDrawer]) {
+        let nodes = store.nodes
+        guard let viewportPlan else {
+            return (nodes.filter { !compositePlan.memberIDs.contains($0.id) }, [:])
+        }
+        // Without authoritative candidate IDs, any node could host LiveNode
+        // content that the registrar hasn't discovered yet.
+        guard let prepare = prepareDirectNodeDrawing, knownLiveNodeCandidates != nil || !isLiveNodeOverlayEnabled else {
+            return (viewportPlan.preparedNodeIndices.map { nodes[$0] }, [:])
+        }
+        let snapshots = store.nodeSnapshots
+        var symbols: [FlowNode<NodeData>] = []
+        var direct: [String: NodeDrawer] = [:]
+        for index in viewportPlan.preparedNodeIndices {
+            let node = nodes[index]
+            if knownLiveNodeCandidates?.contains(node.id) != true,
+               snapshots[node.id] == nil,
+               !liveNodeInteractionCoordinator.hasLiveDrawingState(for: node.id),
+               let draw = prepare(node) {
+                direct[node.id] = draw
+            } else {
+                symbols.append(node)
+            }
+        }
+        return (symbols, direct)
+    }
+
     private func drawNodes(context: inout GraphicsContext, canvasSize: CGSize, compositePlan: NodeCompositePlan,
-                           viewportPlan: FlowViewportRenderPlan?) {
+                           viewportPlan: FlowViewportRenderPlan?, directNodeDrawers: [String: NodeDrawer]) {
         let timing = FlowPerformance.begin(scope: store.performanceScope)
         var attempted = 0
         var resolvedCount = 0
         var suppressed = 0
+        var directCount = 0
         defer {
             timing?.count("flow.render.symbol.attempted", attempted)
             timing?.count("flow.render.symbol.resolved", resolvedCount)
             timing?.count("flow.render.node.suppressed", suppressed)
+            if !directNodeDrawers.isEmpty {
+                timing?.count("flow.render.node.direct_drawn", directCount)
+            }
             timing?.end("flow.render.draw_nodes")
         }
         let viewport = store.viewport
@@ -1044,6 +1095,16 @@ public struct FlowCanvas<
                         if timing != nil { suppressed += 1 }
                         continue
                     }
+                }
+
+                if !directNodeDrawers.isEmpty, let draw = directNodeDrawers[node.id] {
+                    var localContext = context
+                    let origin = viewport.canvasToScreen(node.position)
+                    localContext.translateBy(x: origin.x, y: origin.y)
+                    localContext.scaleBy(x: viewport.zoom, y: viewport.zoom)
+                    draw(&localContext)
+                    if timing != nil { directCount += 1 }
+                    continue
                 }
 
                 if timing != nil { attempted += 1 }

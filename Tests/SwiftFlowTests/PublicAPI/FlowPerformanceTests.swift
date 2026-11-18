@@ -151,11 +151,36 @@ struct FlowPerformanceTests {
         FlowPerformance.configure { output.append($0) }
         defer { FlowPerformance.configure(sink: nil) }
         _ = NSApplication.shared
-        let store = FlowStore(nodes: [FlowNode(id: "visible", position: .init(x: 20, y: 20), data: "node")])
+        let directBack = FlowNode(id: "back", position: .init(x: 20, y: 20), data: "node", zIndex: -1)
+        let directFront = FlowNode(id: "front", position: .init(x: 25, y: 23), data: "node", zIndex: 1)
+        let store = FlowStore(nodes: [
+            directFront, directBack,
+            FlowNode(id: "fallback", position: .zero, data: "node"),
+            FlowNode(id: "candidate", position: .zero, data: "node"),
+            FlowNode(id: "snapshot", position: .zero, data: "node"),
+            FlowNode(id: "distant", position: .init(x: 100_000, y: 100_000), data: "node"),
+        ], viewport: .init(offset: .init(x: 5, y: 10), zoom: 2))
         store.performanceScope = 44
+        let image = try TestCGImageFactory.make(width: 20, height: 20)
+        store.setNodeSnapshot(FlowNodeSnapshot(cgImage: image, scale: 1), for: "snapshot")
         let registry = LiveNodeSnapshotRegistry()
-        let content = FlowCanvas(store: store) { _, _ in Color.red }
-            .liveNodeSupport(.disabled)
+        var preparedIDs: Set<String> = []
+        var symbolIDs: Set<String> = []
+        var directDraws: [(id: String, transform: CGAffineTransform)] = []
+        let content = FlowCanvas(store: store) { node, _ in
+            symbolIDs.insert(node.id)
+            return Color.red
+        }
+            .liveNodeCandidates(["candidate"])
+            .directNodeDrawing { node in
+                preparedIDs.insert(node.id)
+                guard node.id != "fallback" else { return nil }
+                return { context in
+                    directDraws.append((node.id, context.transform))
+                    context.fill(Path(CGRect(origin: .zero, size: node.size)), with: .color(.blue))
+                    context.translateBy(x: 1_000, y: 1_000)
+                }
+            }
             .viewportCulling(preloadMargin: 0, visualBounds: { .bounded($0.frame) })
             .overlay {
                 LiveNodeMountedViewSnapshotHost(nodeID: "surface", size: .init(width: 20, height: 20),
@@ -163,6 +188,7 @@ struct FlowPerformanceTests {
                     .environment(\.flowPerformanceScope, 44)
             }
             .frame(width: 320, height: 240)
+            .environment(\.displayScale, 1)
         let host = NSHostingView(rootView: content)
         let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 320, height: 240),
             styleMask: [.borderless], backing: .buffered, defer: false)
@@ -175,14 +201,22 @@ struct FlowPerformanceTests {
             if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
                 host.cacheDisplay(in: host.bounds, to: bitmap)
             }
-            if !output.durations("flow.render.draw_callback").isEmpty
-                && output.count("flow.snapshot.provider.layout_ready") > 0 { break }
+            if directDraws.count >= 2 && output.count("flow.snapshot.provider.layout_ready") > 0 { break }
             try await Task.sleep(for: .milliseconds(20))
         }
         #expect(!output.durations("flow.render.prepare").isEmpty)
         #expect(!output.durations("flow.render.draw_callback").isEmpty)
         #expect(output.count("flow.render.symbol.attempted") > 0)
         #expect(output.count("flow.render.symbol.resolved") > 0)
+        #expect(output.count("flow.render.node.direct_drawn") >= 2)
+        #expect(preparedIDs == ["back", "front", "fallback"])
+        #expect(symbolIDs == ["fallback", "candidate", "snapshot"])
+        let firstDraws = Array(directDraws.prefix(2))
+        #expect(firstDraws.map(\.id) == ["back", "front"])
+        #expect(firstDraws.map(\.transform) == [directBack, directFront].map { node in
+            let origin = store.viewport.canvasToScreen(node.position)
+            return CGAffineTransform(a: 2, b: 0, c: 0, d: 2, tx: origin.x, ty: origin.y)
+        })
         #expect(output.count("flow.snapshot.provider.layout_ready") == 1)
         #expect(output.samples.allSatisfy { $0.scope == 44 })
     }
