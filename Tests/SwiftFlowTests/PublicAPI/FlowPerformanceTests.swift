@@ -160,6 +160,9 @@ struct FlowPerformanceTests {
             FlowNode(id: "snapshot", position: .zero, data: "node"),
             FlowNode(id: "distant", position: .init(x: 100_000, y: 100_000), data: "node"),
         ], viewport: .init(offset: .init(x: 5, y: 10), zoom: 2))
+        // Scenario gives closed leaves a singleton atomic batch; keep one
+        // direct node outside a batch to verify their shared paint order.
+        store.atomicCompositeRootIDs = ["back", "fallback", "snapshot"]
         store.performanceScope = 44
         let image = try TestCGImageFactory.make(width: 20, height: 20)
         store.setNodeSnapshot(FlowNodeSnapshot(cgImage: image, scale: 1), for: "snapshot")
@@ -171,6 +174,7 @@ struct FlowPerformanceTests {
             symbolIDs.insert(node.id)
             return Color.red
         }
+            .atomicCompositedNodes(contentVersionForMembers: { _, _ in 1 })
             .liveNodeCandidates(["candidate"])
             .directNodeDrawing { node in
                 preparedIDs.insert(node.id)
