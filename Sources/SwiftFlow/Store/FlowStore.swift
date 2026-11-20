@@ -484,6 +484,36 @@ public final class FlowStore<Data: Sendable & Hashable> {
         emitNodeChange(.dimensions(nodeID: nodeID, size: size))
     }
 
+    /// Apply an already-resolved display projection without edit callbacks or Undo.
+    /// A nil data value keeps the current content; supply data only when it changed.
+    /// Position-only updates keep local snapshots. Size and content changes drop them.
+    /// Node identity, hierarchy and stacking order are unchanged.
+    public func projectNodeContents(_ updates: [String: (frame: CGRect, data: Data?)]) {
+        guard !updates.isEmpty else { return }
+        var nextNodes = nodes
+        var nextLookup = nodeLookup
+        var nextSnapshots: [String: FlowNodeSnapshot]?
+        var changed = false
+        for index in nextNodes.indices {
+            let id = nextNodes[index].id
+            guard let update = updates[id],
+                  nextNodes[index].frame != update.frame || update.data != nil else { continue }
+            changed = true
+            if nextNodes[index].size != update.frame.size || update.data != nil {
+                if nextSnapshots == nil, nodeSnapshots[id] != nil { nextSnapshots = nodeSnapshots }
+                nextSnapshots?.removeValue(forKey: id)
+            }
+            nextNodes[index].position = update.frame.origin
+            nextNodes[index].size = update.frame.size
+            if let data = update.data { nextNodes[index].data = data }
+            nextLookup[id] = nextNodes[index]
+        }
+        guard changed else { return }
+        nodes = nextNodes
+        nodeLookup = nextLookup
+        if let nextSnapshots { nodeSnapshots = nextSnapshots }
+    }
+
     // MARK: - Node Snapshots
 
     /// Store a rasterized snapshot for a node. Overwrites any prior entry.

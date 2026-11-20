@@ -1125,6 +1125,28 @@ struct FlowStoreTests {
         #expect(callCount == 5)
     }
 
+    @Test("Batch projection updates hit geometry and retains position-only snapshots without notifying edit clients")
+    func projectNodeContents() {
+        let store = FlowStore(nodes: ["move", "resize", "style", "untouched"].map {
+            FlowNode(id: $0, position: .zero, size: CGSize(width: 10, height: 10), data: $0)
+        })
+        for node in store.nodes { store.setNodeSnapshot(makeSnapshot(), for: node.id) }
+        var emittedChanges = false
+        store.onNodesChange = { _ in emittedChanges = true }
+        store.beginInteractiveUpdates()
+        store.projectNodeContents([
+            "move": (CGRect(x: 50, y: 0, width: 10, height: 10), nil),
+            "resize": (CGRect(x: 0, y: 0, width: 30, height: 20), nil),
+            "style": (CGRect(x: 0, y: 0, width: 10, height: 10), "new appearance")
+        ])
+        store.endInteractiveUpdates()
+        #expect(!emittedChanges)
+        #expect(store.nodesInHitTestOrder.first { $0.id == "move" }?.frame.contains(CGPoint(x: 55, y: 5)) == true)
+        #expect(store.nodeLookup["resize"]?.size == CGSize(width: 30, height: 20))
+        #expect(store.nodeLookup["style"]?.data == "new appearance")
+        #expect(Set(store.nodeSnapshots.keys) == ["move", "untouched"])
+    }
+
     private func makeSnapshot() -> FlowNodeSnapshot {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
