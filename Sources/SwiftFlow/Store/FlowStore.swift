@@ -19,7 +19,11 @@ public final class FlowStore<Data: Sendable & Hashable> {
     public private(set) var dropTargetEdgeID: String?
     /// Closed visual subtrees share one painter-order and hit-test boundary.
     /// Node identity and geometry remain independent in the store.
-    public var atomicCompositeRootIDs: Set<String> = []
+    public var atomicCompositeRootIDs: Set<String> = [] {
+        didSet {
+            if atomicCompositeRootIDs != oldValue { atomicHitTestOrder = nil }
+        }
+    }
     public var configuration: FlowConfiguration
 
     /// Transient consumer correlation only; never persisted or observed by rendering.
@@ -47,6 +51,8 @@ public final class FlowStore<Data: Sendable & Hashable> {
     private(set) var nodeIndicesFrontToBack: [Int] = []
     /// Hit-test order derived from front-to-back order, with descendants before ancestors.
     private var nodeIndicesHitTestOrder: [Int] = []
+    /// Order only; hit tests always use the current node geometry.
+    @ObservationIgnored private var atomicHitTestOrder: [Int]?
 
     // MARK: - Internal State
 
@@ -139,10 +145,16 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     private var interactionNodeIndices: [Int] {
-        guard !atomicCompositeRootIDs.isEmpty else { return nodeIndicesHitTestOrder }
-        let plan = compositeNodePlan(roots: atomicCompositeRootIDs, atomic: true)
+        let roots = atomicCompositeRootIDs
+        guard !roots.isEmpty else { return nodeIndicesHitTestOrder }
+        let frontToBack = nodeIndicesFrontToBack
+        if let atomicHitTestOrder { return atomicHitTestOrder }
+
+        let timing = FlowPerformance.begin(scope: performanceScope)
+        defer { timing?.end("flow.interaction.atomic_hit_order.rebuild") }
+        let plan = compositeNodePlan(roots: roots, atomic: true)
         let indices = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { ($0.element.id, $0.offset) })
-        let ordered = nodeIndicesFrontToBack.flatMap { index -> [Int] in
+        let ordered = frontToBack.flatMap { index -> [Int] in
             let id = nodes[index].id
             if let batch = plan.batchAtNodeID[id] {
                 return batch.members.reversed().compactMap { indices[$0] }
@@ -151,12 +163,14 @@ public final class FlowStore<Data: Sendable & Hashable> {
         }
         // Entered containers retain their background but must not mask their
         // descendants' interaction targets, even with a higher authored zIndex.
-        return ordered.enumerated().sorted { lhs, rhs in
+        let hitOrder = ordered.enumerated().sorted { lhs, rhs in
             let left = nodes[lhs.element].id, right = nodes[rhs.element].id
             if isAncestor(left, of: right) { return false }
             if isAncestor(right, of: left) { return true }
             return lhs.offset < rhs.offset
         }.map(\.element)
+        atomicHitTestOrder = hitOrder
+        return hitOrder
     }
 
     // MARK: - Hierarchy
@@ -1932,6 +1946,8 @@ public final class FlowStore<Data: Sendable & Hashable> {
             nodes[index].parentID = parentID
             nodeLookup[nodeID] = nodes[index]
             didChangeHierarchy = true
+            // Synchronous callbacks can hit-test before the base order is rebuilt.
+            atomicHitTestOrder = nil
             emitNodeChange(.replace(nodes[index]))
         }
         if didChangeHierarchy {
@@ -2007,6 +2023,7 @@ public final class FlowStore<Data: Sendable & Hashable> {
     }
 
     private func rebuildSortedNodes() {
+        atomicHitTestOrder = nil
         // Stable sort: among equal zIndex, preserve reversed array order (later = front)
         nodeIndicesFrontToBack = nodes.indices.sorted { lhs, rhs in
             if nodes[lhs].zIndex != nodes[rhs].zIndex {

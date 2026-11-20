@@ -213,8 +213,50 @@ struct NodeCompositePlanTests {
         store.atomicCompositeRootIDs = ["group"]
         #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "first")
         #expect(store.nodesInHitTestOrder.map(\.id) == ["last", "first", "group", "outside"])
+        store.atomicCompositeRootIDs = ["first", "last"]
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "outside")
+        store.atomicCompositeRootIDs = ["group"]
+        #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "first")
         store.atomicCompositeRootIDs = []
         #expect(store.hitTestNode(at: CGPoint(x: 20, y: 20)) == "outside")
+    }
+
+    @Test func warmAtomicOrderTracksStructureAndUsesLiveGeometryForNodesAndPorts() {
+        let handle = HandleDeclaration(id: "port", type: .source, position: .center)
+        let store = FlowStore(nodes: [
+            FlowNode(id: "group", position: CGPoint(x: -200, y: -200), data: "Group", acceptsChildren: true, zIndex: -2, handles: []),
+            FlowNode(id: "member", position: .zero, data: "Member", parentID: "group", zIndex: 1, handles: [handle]),
+            FlowNode(id: "outside", position: .zero, data: "Outside", zIndex: 0, handles: [handle])
+        ])
+        store.atomicCompositeRootIDs = ["group"]
+        func expectHit(_ id: String, at point: CGPoint = CGPoint(x: 75, y: 30)) {
+            #expect(store.hitTestNode(at: point) == id)
+            #expect(store.hitTestHandle(at: point)?.nodeID == id)
+        }
+        expectHit("member")
+        store.configuration.snapToGrid = false
+        store.moveNode("member", to: CGPoint(x: 300, y: 0))
+        store.viewport = Viewport(offset: CGPoint(x: 60, y: 80), zoom: 2)
+        expectHit("outside")
+        expectHit("member", at: CGPoint(x: 375, y: 30))
+        store.moveNode("member", to: .zero)
+        store.setParent(of: "outside", to: "group")
+        #expect(store.nodesInHitTestOrder.map(\.id) == ["member", "outside", "group"])
+        store.setParent(of: "outside", to: nil)
+        #expect(store.nodesInHitTestOrder.map(\.id) == ["member", "group", "outside"])
+
+        store.updateNode("outside") { $0.zIndex = 2 }
+        expectHit("outside")
+        store.addNode(FlowNode(id: "top", position: .zero, data: "Top", zIndex: 3, handles: [handle]))
+        expectHit("top")
+        store.removeNode("top")
+        expectHit("outside")
+
+        let saved = store.export()
+        store.removeNode("outside")
+        expectHit("member")
+        store.load(saved)
+        expectHit("outside")
     }
 
     @Test func enteredAncestorDoesNotMaskAClosedNestedGroup() {
